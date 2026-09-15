@@ -17,17 +17,13 @@ const UNRELEASED_STATUSES = new Set([
 ]);
 
 function applyAgeRatingFilter(metas: any[], type: string, config: any): any[] {
-  if (!hasAgeRatingCap(config)) {
-    return metas;
-  }
-
+  if (!hasAgeRatingCap(config)) return metas;
   const allowUnrated = allowsUnrated(config);
   const before = metas.length;
   const filtered = metas.filter(meta => {
     const cert = meta.app_extras?.certification || meta.certification || null;
     return passesAgeRating(cert, meta.type || type, config.ageRating, allowUnrated);
   });
-
   if (before !== filtered.length) {
     logger.info(`[AgeRating] Filtered out ${before - filtered.length} items (max: ${config.ageRating})`);
   }
@@ -48,21 +44,36 @@ const WATCHED_FILTERS: [string, string][] = [
   ['simklTokenId', 'hideWatchedSimkl'],
 ];
 
+function isExternalCatalog(catalogConfig: any): boolean {
+  return catalogConfig?.source === 'custom'
+    || catalogConfig?.source === 'stremthru'
+    || !!catalogConfig?.sourceUrl;
+}
+
 function catalogFiltersActive({ config, catalogConfig, cleanId }: Omit<CatalogFilterOptions, 'type'>): boolean {
   const isSearch = ['search', 'people_search', 'gemini.search'].includes(cleanId);
+  const externalCatalog = isExternalCatalog(catalogConfig);
 
   if (hasAgeRatingCap(config)) return true;
 
   const catalogHideDigital = catalogConfig?.metadata?.hideUnreleasedDigital;
   const hideUnreleasedDigital = isSearch
     ? !!config.hideUnreleasedDigitalSearch
-    : (catalogHideDigital !== undefined ? catalogHideDigital : !!config.hideUnreleasedDigital);
+    : catalogHideDigital !== undefined
+      ? catalogHideDigital
+      : externalCatalog
+        ? false
+        : !!config.hideUnreleasedDigital;
   if (hideUnreleasedDigital) return true;
 
   const catalogHideShows = catalogConfig?.metadata?.hideUnreleasedShows;
   const hideUnreleasedShows = isSearch
     ? !!config.hideUnreleasedShowsSearch
-    : (catalogHideShows !== undefined ? catalogHideShows : !!config.hideUnreleasedShows);
+    : catalogHideShows !== undefined
+      ? catalogHideShows
+      : externalCatalog
+        ? false
+        : !!config.hideUnreleasedShows;
   if (hideUnreleasedShows) return true;
 
   if (!isHideWatchedExcluded(cleanId)) {
@@ -80,6 +91,7 @@ async function applyCatalogFilters(metas: any[], { type, config, catalogConfig, 
   if (!Array.isArray(metas) || metas.length === 0) return metas;
 
   const isSearch = ['search', 'people_search', 'gemini.search'].includes(cleanId);
+  const externalCatalog = isExternalCatalog(catalogConfig);
 
   metas = applyAgeRatingFilter(metas, type, config);
   const hideWatchedExcluded = isHideWatchedExcluded(cleanId);
@@ -87,7 +99,11 @@ async function applyCatalogFilters(metas: any[], { type, config, catalogConfig, 
   const catalogHideDigital = catalogConfig?.metadata?.hideUnreleasedDigital;
   const hideUnreleasedDigital = isSearch
     ? !!config.hideUnreleasedDigitalSearch
-    : (catalogHideDigital !== undefined ? catalogHideDigital : !!config.hideUnreleasedDigital);
+    : catalogHideDigital !== undefined
+      ? catalogHideDigital
+      : externalCatalog
+        ? false
+        : !!config.hideUnreleasedDigital;
 
   if (hideUnreleasedDigital) {
     const { isReleasedDigitally } = require('./parseProps');
@@ -101,7 +117,11 @@ async function applyCatalogFilters(metas: any[], { type, config, catalogConfig, 
   const catalogHideShows = catalogConfig?.metadata?.hideUnreleasedShows;
   const hideUnreleasedShows = isSearch
     ? !!config.hideUnreleasedShowsSearch
-    : (catalogHideShows !== undefined ? catalogHideShows : !!config.hideUnreleasedShows);
+    : catalogHideShows !== undefined
+      ? catalogHideShows
+      : externalCatalog
+        ? false
+        : !!config.hideUnreleasedShows;
 
   if (hideUnreleasedShows) {
     const now = new Date();
@@ -136,9 +156,7 @@ async function applyCatalogFilters(metas: any[], { type, config, catalogConfig, 
             if (meta.imdb_id && idSet.has(meta.imdb_id)) return false;
             return true;
           });
-          if (before !== metas.length) {
-            logger.debug(`Hide Trakt watched: removed ${before - metas.length} items`);
-          }
+          if (before !== metas.length) logger.debug(`Hide Trakt watched: removed ${before - metas.length} items`);
         }
       } catch (err: any) {
         logger.warn(`Hide Trakt watched filter error: ${err.message}`);
@@ -161,30 +179,20 @@ async function applyCatalogFilters(metas: any[], { type, config, catalogConfig, 
             const metaId = meta.id || '';
             let anilistId: number | null = null;
             let malId: number | null = null;
-            if (metaId.startsWith('anilist:')) {
-              anilistId = parseInt(metaId.split(':')[1], 10);
-            } else if (metaId.startsWith('mal:')) {
-              malId = parseInt(metaId.split(':')[1], 10);
-            } else if (metaId.startsWith('kitsu:')) {
+            if (metaId.startsWith('anilist:')) anilistId = parseInt(metaId.split(':')[1], 10);
+            else if (metaId.startsWith('mal:')) malId = parseInt(metaId.split(':')[1], 10);
+            else if (metaId.startsWith('kitsu:')) {
               const mapping = idMapper.getMappingByKitsuId(parseInt(metaId.split(':')[1], 10));
-              if (mapping) {
-                anilistId = mapping.anilist_id;
-                malId = mapping.mal_id;
-              }
+              if (mapping) { anilistId = mapping.anilist_id; malId = mapping.mal_id; }
             } else if (metaId.startsWith('anidb:')) {
               const mapping = idMapper.getMappingByAnidbId(parseInt(metaId.split(':')[1], 10));
-              if (mapping) {
-                anilistId = mapping.anilist_id;
-                malId = mapping.mal_id;
-              }
+              if (mapping) { anilistId = mapping.anilist_id; malId = mapping.mal_id; }
             }
             if (anilistId && watchedIds.anilistIds.has(anilistId)) return false;
             if (malId && watchedIds.malIds.has(malId)) return false;
             return true;
           });
-          if (before !== metas.length) {
-            logger.debug(`Hide AniList watched: removed ${before - metas.length} items`);
-          }
+          if (before !== metas.length) logger.debug(`Hide AniList watched: removed ${before - metas.length} items`);
         }
       } catch (err: any) {
         logger.warn(`Hide AniList watched filter error: ${err.message}`);
@@ -211,9 +219,7 @@ async function applyCatalogFilters(metas: any[], { type, config, catalogConfig, 
             if (meta.imdb_id && idSet.has(meta.imdb_id)) return false;
             return true;
           });
-          if (before !== metas.length) {
-            logger.debug(`Hide MDBList watched: removed ${before - metas.length} items`);
-          }
+          if (before !== metas.length) logger.debug(`Hide MDBList watched: removed ${before - metas.length} items`);
         }
       } catch (err: any) {
         logger.warn(`Hide MDBList watched filter error: ${err.message}`);
@@ -239,33 +245,22 @@ async function applyCatalogFilters(metas: any[], { type, config, catalogConfig, 
             const idSet = isMovie ? watchedIds.movieImdbIds : watchedIds.showImdbIds;
             if (metaId.startsWith('tt') && idSet.has(metaId)) return false;
             if (meta.imdb_id && idSet.has(meta.imdb_id)) return false;
-
             let anilistId: number | null = null;
             let malId: number | null = null;
-            if (metaId.startsWith('anilist:')) {
-              anilistId = parseInt(metaId.split(':')[1], 10);
-            } else if (metaId.startsWith('mal:')) {
-              malId = parseInt(metaId.split(':')[1], 10);
-            } else if (metaId.startsWith('kitsu:')) {
+            if (metaId.startsWith('anilist:')) anilistId = parseInt(metaId.split(':')[1], 10);
+            else if (metaId.startsWith('mal:')) malId = parseInt(metaId.split(':')[1], 10);
+            else if (metaId.startsWith('kitsu:')) {
               const mapping = idMapper.getMappingByKitsuId(parseInt(metaId.split(':')[1], 10));
-              if (mapping) {
-                anilistId = mapping.anilist_id;
-                malId = mapping.mal_id;
-              }
+              if (mapping) { anilistId = mapping.anilist_id; malId = mapping.mal_id; }
             } else if (metaId.startsWith('anidb:')) {
               const mapping = idMapper.getMappingByAnidbId(parseInt(metaId.split(':')[1], 10));
-              if (mapping) {
-                anilistId = mapping.anilist_id;
-                malId = mapping.mal_id;
-              }
+              if (mapping) { anilistId = mapping.anilist_id; malId = mapping.mal_id; }
             }
             if (malId && watchedIds.malIds.has(malId)) return false;
             if (anilistId && watchedIds.anilistIds.has(anilistId)) return false;
             return true;
           });
-          if (before !== metas.length) {
-            logger.debug(`Hide Simkl watched: removed ${before - metas.length} items`);
-          }
+          if (before !== metas.length) logger.debug(`Hide Simkl watched: removed ${before - metas.length} items`);
         }
       } catch (err: any) {
         logger.warn(`Hide Simkl watched filter error: ${err.message}`);
@@ -277,9 +272,7 @@ async function applyCatalogFilters(metas: any[], { type, config, catalogConfig, 
     const { filterMetasByRegex } = require('./regexFilter');
     const before = metas.length;
     metas = filterMetasByRegex(metas, config.exclusionKeywords || '', config.regexExclusionFilter || '', config.exclusionGenres || '');
-    if (before !== metas.length) {
-      logger.debug(`Content exclusion filter: removed ${before - metas.length} items`);
-    }
+    if (before !== metas.length) logger.debug(`Content exclusion filter: removed ${before - metas.length} items`);
   }
 
   return metas;
