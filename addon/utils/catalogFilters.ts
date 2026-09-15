@@ -56,14 +56,18 @@ function catalogFiltersActive({ config, catalogConfig, cleanId }: Omit<CatalogFi
 
   if (hasAgeRatingCap(config)) return true;
 
+  // External catalogs must use the multi-page fill path even when no content
+  // filter is enabled. Their upstream page size is independent of AIOMeta's
+  // client batch size, so a single upstream page can be too small to fill a
+  // Nuvio home row. This keeps pagination correct for custom/StremThru feeds.
+  if (externalCatalog) return true;
+
   const catalogHideDigital = catalogConfig?.metadata?.hideUnreleasedDigital;
   const hideUnreleasedDigital = isSearch
     ? !!config.hideUnreleasedDigitalSearch
     : catalogHideDigital !== undefined
       ? catalogHideDigital
-      : externalCatalog
-        ? false
-        : !!config.hideUnreleasedDigital;
+      : !!config.hideUnreleasedDigital;
   if (hideUnreleasedDigital) return true;
 
   const catalogHideShows = catalogConfig?.metadata?.hideUnreleasedShows;
@@ -71,9 +75,7 @@ function catalogFiltersActive({ config, catalogConfig, cleanId }: Omit<CatalogFi
     ? !!config.hideUnreleasedShowsSearch
     : catalogHideShows !== undefined
       ? catalogHideShows
-      : externalCatalog
-        ? false
-        : !!config.hideUnreleasedShows;
+      : !!config.hideUnreleasedShows;
   if (hideUnreleasedShows) return true;
 
   if (!isHideWatchedExcluded(cleanId)) {
