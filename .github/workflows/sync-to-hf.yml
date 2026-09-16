@@ -12,8 +12,8 @@ jobs:
       - name: Sync repository to Hugging Face
         uses: huggingface/hub-sync@v0.1.0
         with:
-          github_repository: ${{ github.repository }}
-          huggingface_repository: Lambda666/AIOMeta
-          github_branch: dev
-          huggingface_branch: main
+          github_repo_id: ${{ github.repository }}
+          huggingface_repo_id: Lambda666/AIOMeta
           hf_token: ${{ secrets.HF_TOKEN }}
+          repo_type: space
+          space_sdk: gradio
