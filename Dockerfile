@@ -7,7 +7,7 @@ RUN npm run build && npm run build:backend
 
 FROM node:24-alpine AS runner
 WORKDIR /app
-RUN apk add --no-cache ca-certificates wget
+RUN apk add --no-cache ca-certificates wget redis
 COPY package*.json package-lock.json* ./
 RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
 COPY --from=builder /app/addon ./addon
