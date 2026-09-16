@@ -4,6 +4,8 @@
 
 ---
 
+<!-- Hugging Face sync trigger -->
+
 ## 🚀 Features
 
 - **Multi-Source Metadata**: Choose your preferred provider for each type (movie, series, anime) — TMDB, TVDB, MAL, AniList, IMDb, TVmaze, etc.
@@ -42,14 +44,6 @@ services:
     init: true
     env_file:
       - .env
-    # labels:  # Optional: Remove if not using Traefik
-    #   - "traefik.enable=true"
-    #   - "traefik.http.routers.aiometadata.rule=Host(`${AIOMETADATA_HOSTNAME?}`)"
-    #   - "traefik.http.routers.aiometadata.entrypoints=websecure"
-    #   - "traefik.http.routers.aiometadata.tls.certresolver=letsencrypt"
-    #   - "traefik.http.routers.aiometadata.middlewares=authelia@docker"
-    #   - "traefik.http.services.aiometadata.loadbalancer.server.port=3232"
-    #   - "traefik.http.routers.aiometadata.service=aiometadata"
     volumes:
       - ${DOCKER_DATA_DIR}/aiometadata/data:/app/addon/data
     depends_on:
@@ -75,22 +69,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
-  #aiometadata_postgres:
-  #  image: postgres:latest
-  #  container_name: aiometadata_postgres
-  #  restart: unless-stopped
-  #  environment:
-  #    - POSTGRES_DB=aiometadata
-  #    - POSTGRES_USER=postgres
-  #    - POSTGRES_PASSWORD=password
-  #  volumes:
-  #    - ${DOCKER_DATA_DIR}/aiometadata/postgres:/var/lib/postgresql/data
-  #  healthcheck:
-  #    test: ["CMD-SHELL", "pg_isready -U postgres -d aiometadata"]
-  #    interval: 10s
-  #    timeout: 5s
-  #    retries: 5
 ```
 
 Create a `.env` file with your API keys and settings as shown in [.env.example](.env.example) 
@@ -171,22 +149,22 @@ We welcome community contributions! However, to keep review times manageable, we
 
 ## 📄 License
 
-GPL-3.0 — see [LICENSE](LICENSE).
+GPL-3.0 — see **LICENSE**.
 
 ---
 
 ## 🙏 Credits
 
-- [Stremio](https://www.stremio.com/)
-- [TMDB](https://www.themoviedb.org/)
-- [TVDB](https://thetvdb.com/)
-- [MyAnimeList](https://myanimelist.net/)
-- [AniList](https://anilist.co/)
-- [Fanart.tv](https://fanart.tv/)
-- [MDBList](https://mdblist.com/)
-- [RPDB](https://rpdb.net/)
+- **Stremio**
+- **TMDB**
+- **TVDB**
+- **MyAnimeList**
+- **AniList**
+- **Fanart.tv**
+- **MDBList**
+- **RPDB**
 
-**Special thanks to [MrCanelas](https://github.com/mrcanelas), the original developer of the TMDB Addon for Stremio, whose work inspired and laid the groundwork for this project.**
+**Special thanks to the original developer of the TMDB Addon for Stremio, whose work inspired and laid the groundwork for this project.**
 
 ---
 
