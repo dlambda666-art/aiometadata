@@ -9,11 +9,17 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout dev
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+
       - name: Sync repository to Hugging Face
         uses: huggingface/hub-sync@v0.1.0
         with:
-          github_repo_id: ${{ github.repository }}
+          github_repo_id: dlambda666-art/aiometadata
           huggingface_repo_id: Lambda666/AIOMeta
           hf_token: ${{ secrets.HF_TOKEN }}
           repo_type: space
           space_sdk: gradio
+          private: false
