@@ -13,4 +13,8 @@ if [ -z "${DATABASE_URI:-}" ]; then
   export DATABASE_URI="sqlite://addon/data/db.sqlite"
 fi
 
+# HF Docker Spaces runs a single container. Start the local Redis service
+# expected by AIOMetadata before starting the backend.
+redis-server --daemonize yes
+
 exec node dist/server/server.js
