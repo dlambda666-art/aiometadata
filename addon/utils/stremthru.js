@@ -82,6 +82,21 @@ async function _processAnimeItem(item, provider, id, language, config, includeVi
 }
 
 /**
+ * Preserved external metas skip AIOMeta's artwork pipeline, so a user's custom
+ * poster URL (e.g. a badge service) is applied here when the item carries an
+ * IMDb or TMDB id. Without a custom pattern the upstream poster is kept.
+ */
+function externalCustomPoster(item, type, config) {
+  if (!config?.customPosterUrlPattern) return null;
+  const pattern = Utils.resolvePosterPattern(config);
+  if (!pattern) return null;
+  const imdbId = String(item.imdb_id || item.id || '').match(/^tt\d+/i)?.[0] || null;
+  const tmdbId = String(item.id || '').match(/^tmdb:(\d+)/i)?.[1] || null;
+  if (!imdbId && !tmdbId) return null;
+  return Utils.resolveCustomArtUrl(pattern, { id: item.id, imdbId, tmdbId }, type, config, { shape: Utils.posterShapeOf(item) });
+}
+
+/**
  * External addons already return Stremio metas. Re-resolving every item through
  * AIOMeta's metadata providers can drop or rewrite valid upstream entries,
  * especially future releases whose metadata provider has no released record yet.
@@ -98,6 +113,8 @@ async function _processStandardItem(item, provider, language, config, includeVid
     if (meta.genres == null && Array.isArray(item.genres)) meta.genres = item.genres;
     if (meta.releaseInfo == null && item.releaseInfo != null) meta.releaseInfo = item.releaseInfo;
     if (meta.year == null && item.year != null) meta.year = item.year;
+    const customPoster = externalCustomPoster(item, meta.type, config);
+    if (customPoster) meta.poster = customPoster;
     return meta;
   }
 
