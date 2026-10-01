@@ -2,6 +2,7 @@ const net = require('node:net');
 const { request, Agent, setGlobalDispatcher, ProxyAgent } = require("undici");
 const buildInfo = require('../lib/buildInfo');
 const { withRetries, isRetryableNetworkError } = require('./retry');
+const { noteTrackerCall } = require('./trackerCalls');
 
 net.setDefaultAutoSelectFamilyAttemptTimeout(1_000);
 
@@ -18,11 +19,21 @@ const getProxyUrl = (): string | null => {
   return null;
 };
 
+// Idle connections outlive undici's 4 s default, so bursts reuse their TLS sessions.
+export const KEEP_ALIVE = {
+  keepAliveTimeout: parseInt(process.env.HTTP_KEEPALIVE_TIMEOUT_MS || '', 10) || 60_000,
+  keepAliveMaxTimeout: parseInt(process.env.HTTP_KEEPALIVE_MAX_TIMEOUT_MS || '', 10) || 600_000,
+};
+
 const proxyUrl = getProxyUrl();
+
+/** Calls the addon makes to itself, which a proxy can neither see nor reach. */
+export const directDispatcher = new Agent({ allowH2: false, ...KEEP_ALIVE });
+
 if (proxyUrl) {
   setGlobalDispatcher(new ProxyAgent({ uri: proxyUrl, allowH2: false }));
 } else {
-  setGlobalDispatcher(new Agent({ allowH2: false }));
+  setGlobalDispatcher(directDispatcher);
 }
 
 const DEFAULT_RETRY_ATTEMPTS = 1;
@@ -43,6 +54,7 @@ interface HttpRequestOptions {
   dispatcher?: any;
   params?: Record<string, string>;
   retryAttempts?: number;
+  validateStatus?: (status: number) => boolean;
 }
 
 interface HttpResponse {
@@ -66,7 +78,8 @@ export async function httpRequest(url: string, options: HttpRequestOptions = {})
     headers = {},
     timeout = 8000,
     dispatcher,
-    params
+    params,
+    validateStatus
   } = options;
 
   if (params) {
@@ -93,7 +106,14 @@ export async function httpRequest(url: string, options: HttpRequestOptions = {})
     }
   }
 
-  const { statusCode, headers: responseHeaders, body } = await request(url, requestOptions);
+  let response: any;
+  try {
+    response = await request(url, requestOptions);
+  } catch (error) {
+    noteTrackerCall(url, 0);
+    throw error;
+  }
+  const { statusCode, headers: responseHeaders, body } = response;
 
   const contentType =
     responseHeaders['content-type'] ||
@@ -101,6 +121,7 @@ export async function httpRequest(url: string, options: HttpRequestOptions = {})
     '';
 
   if (statusCode >= 200 && statusCode < 300) {
+    noteTrackerCall(url, statusCode);
     if (method === 'HEAD') {
       return {
         data: null,
@@ -120,6 +141,11 @@ export async function httpRequest(url: string, options: HttpRequestOptions = {})
       headers: responseHeaders
     };
   } else if (statusCode === 304) {
+    await body.dump();
+    if (validateStatus?.(304)) {
+      noteTrackerCall(url, statusCode);
+      return { data: null, status: statusCode, headers: responseHeaders };
+    }
     const error: HttpError = new Error(`Not Modified`);
     error.response = {
       status: 304,
@@ -128,6 +154,7 @@ export async function httpRequest(url: string, options: HttpRequestOptions = {})
     throw error;
   } else {
     const errorText = await body.text();
+    noteTrackerCall(url, statusCode, errorText, responseHeaders['retry-after']);
     const error: HttpError = new Error(`Request failed with status code ${statusCode}`);
     error.response = {
       status: statusCode,

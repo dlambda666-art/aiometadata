@@ -26,6 +26,8 @@ import {
 } from './config.js';
 import { isNotModified, mergeRevalidated, type ConditionalValidators, type FetchOutcome } from './upstream.js';
 import { walkFiles, pruneEmptyDirs } from './walk.js';
+import { shapePoster } from './shape.js';
+import { envInt } from '../../utils/envNumber';
 
 const logger = consola.withTag('PosterCache');
 
@@ -742,17 +744,29 @@ async function dropAndServe(
   };
 }
 
+/**
+ * An expired entry is answered at once and refreshed behind the request, since a
+ * slow origin would otherwise hold every client until its timeout only to be
+ * served the same bytes. The warmer waits instead, so its concurrency cap holds.
+ */
 export async function getOrFetch(
   imageClass: ImageClass,
   key: string,
-  producer: ImageProducer
+  producer: ImageProducer,
+  options: { awaitRefresh?: boolean } = {}
 ): Promise<FetchResult> {
   const cached = await get(imageClass, key);
   if (cached && !cached.expired) return { entry: cached, status: 'HIT' };
+  const serveStale = !!cached && !options.awaitRefresh;
+  // Opened now, before a refresh behind it can replace the file it reads.
+  const stale = (): FetchResult => {
+    const opened = cached!.body || !cached!.openStream ? undefined : cached!.openStream();
+    return { entry: opened ? { ...cached!, openStream: () => opened } : cached!, status: 'STALE' };
+  };
 
   const lockKey = indexKey(imageClass, hashKey(key));
   const existing = inflight.get(lockKey);
-  if (existing) return existing;
+  if (existing) return serveStale ? stale() : existing;
 
   const store = async (produced: { body: Buffer; contentType: string; upstream?: UpstreamCacheMeta }) => {
     if (isNotStorable(key, produced.upstream)) return dropAndServe(imageClass, key, produced);
@@ -777,8 +791,11 @@ export async function getOrFetch(
 
   const task = (async (): Promise<FetchResult> => {
     try {
-      const produced = await producer(revalidationHint(cached));
-      if (!isNotModified(produced)) return await store(produced);
+      let produced = await producer(revalidationHint(cached));
+      if (!isNotModified(produced)) {
+        if (imageClass === 'poster') produced = { ...produced, ...(await shapePoster(produced.body, produced.contentType)) };
+        return await store(produced);
+      }
 
       const merged = mergeRevalidated(cached?.upstream, produced.upstream);
 
@@ -817,6 +834,10 @@ export async function getOrFetch(
   })();
 
   inflight.set(lockKey, task);
+  if (serveStale) {
+    task.catch((error: any) => logger.debug(`Background refresh of ${imageClass} failed: ${error?.message}`));
+    return stale();
+  }
   return task;
 }
 
@@ -1217,6 +1238,29 @@ async function scan(): Promise<void> {
       onError: (error: any, dir: string) => logger.warn(`Could not scan ${dir}: ${error?.message}`)
     });
 
+    // Stats run many at a time.
+    const width = envInt('POSTER_CACHE_SCAN_CONCURRENCY', 32, 1);
+    let batch: string[] = [];
+    const statBatch = async () => {
+      const names = batch;
+      batch = [];
+      await Promise.all(names.map(async (name) => {
+        try {
+          const stat = await fsp.stat(entryPath(imageClass, name));
+          addToIndex({
+            imageClass,
+            hash: name,
+            size: stat.size,
+            lastAccess: stat.atimeMs,
+            storedAt: stat.mtimeMs,
+            inferredMs: null,
+          });
+          found += 1;
+        } catch {
+          // Vanished between readdir and stat — nothing to index.
+        }
+      }));
+    };
     for await (const { name, dir } of files) {
       if (name.endsWith('.tmp')) {
         // Interrupted write from a previous run.
@@ -1224,21 +1268,10 @@ async function scan(): Promise<void> {
         continue;
       }
       if (!/^[0-9a-f]{64}$/.test(name)) continue;
-      try {
-        const stat = await fsp.stat(entryPath(imageClass, name));
-        addToIndex({
-          imageClass,
-          hash: name,
-          size: stat.size,
-          lastAccess: stat.atimeMs,
-          storedAt: stat.mtimeMs,
-          inferredMs: null,
-        });
-        found += 1;
-      } catch {
-        // Vanished between readdir and stat — nothing to index.
-      }
+      batch.push(name);
+      if (batch.length >= width) await statBatch();
     }
+    if (batch.length) await statBatch();
   }
 
   scanning = false;

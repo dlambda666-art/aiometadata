@@ -1,4 +1,5 @@
 const redis = require("./redisClient");
+const metrics = require("./metricsBatch");
 const consola = require("consola");
 const { isMetricsDisabled } = require('./metricsConfig');
 
@@ -127,11 +128,9 @@ class RequestTracker {
 
       this.trackContentRequest(req);
 
-      redis.incr(`requests:total`).catch(() => {});
-      redis.incr(`requests:${today}`).catch(() => {});
-      redis.incr(`requests:${hour}`).catch(() => {});
-      redis.expire(`requests:${today}`, 86400 * 30).catch(() => {}); // 30 days
-      redis.expire(`requests:${hour}`, 86400 * 31).catch(() => {}); // 31 days
+      metrics.incr(`requests:total`);
+      metrics.incr(`requests:${today}`, 86400 * 30);
+      metrics.incr(`requests:${hour}`, 86400 * 31);
 
       // Track metadata requests for activity feed
       const normalizedPath = this.normalizeEndpoint(req.path);
@@ -173,17 +172,14 @@ class RequestTracker {
         this.trackActiveUser(userIdentifier, req).catch(() => {});
 
         const hour = new Date().toISOString().substring(0, 13);
-        redis.lpush(`response_times:${hour}`, responseTime).catch(() => {});
-        redis.ltrim(`response_times:${hour}`, 0, 999).catch(() => {}); // Keep last 1000 for hourly averages
-        redis.expire(`response_times:${hour}`, 86400 * 7).catch(() => {}); // 7 days expiration
+        metrics.push(`response_times:${hour}`, responseTime, 1000, 86400 * 7);
 
         // Track errors
         if (statusCode >= 400) {
-          redis.incr(`errors:total`).catch(() => {});
-          redis.incr(`errors:${today}`).catch(() => {});
+          metrics.incr(`errors:total`);
+          metrics.incr(`errors:${today}`);
         } else {
-          redis.incr(`success:${today}`).catch(() => {});
-          redis.expire(`success:${today}`, 86400 * 30).catch(() => {});
+          metrics.incr(`success:${today}`, 86400 * 30);
         }
       }
 
@@ -201,8 +197,7 @@ class RequestTracker {
               /\/catalog\/[^/]+\/[^/]+\/(.*)\.(json|xml)$/i,
             );
             if (extrasMatch && extrasMatch[1]) {
-              const extrasPart = extrasMatch[1];
-              const segments = extrasPart.split("/");
+              const segments = extrasMatch[1].split(/[/&]/);
               for (const segment of segments) {
                 if (segment.toLowerCase().startsWith("search=")) {
                   const val = segment.substring("search=".length);
@@ -228,10 +223,7 @@ class RequestTracker {
 
           // Track search success if results were found
           if (resultsCount > 0) {
-            redis
-              .zincrby(`search_success:${today}`, 1, queryNorm)
-              .catch(() => {});
-            redis.expire(`search_success:${today}`, 86400 * 30).catch(() => {});
+            metrics.zincr(`search_success:${today}`, queryNorm, 86400 * 30);
           }
         }
       }
@@ -273,6 +265,33 @@ class RequestTracker {
     return `content_metadata:${type}:${this.normalizeContentId(rawId)}`;
   }
 
+  async readContentMetadata(type, rawId) {
+    const read = async (key) => {
+      try {
+        const str = await redis.get(key);
+        return str ? JSON.parse(str) : null;
+      } catch (_) {
+        return null;
+      }
+    };
+    const id = this.normalizeContentId(rawId);
+    const direct = await read(this.canonicalContentMetadataKey(type, id));
+    if (direct) return direct;
+
+    const match = /^(tmdb|tvdb):(\d+)$/.exec(id);
+    if (!match) return null;
+    let dataKey = `id_map:data:${type}:${match[2]}`;
+    if (match[1] === 'tvdb') {
+      try {
+        dataKey = await redis.get(`id_map:ptr:tvdb:${type}:${match[2]}`);
+      } catch (_) {
+        dataKey = null;
+      }
+    }
+    const mapping = dataKey ? await read(dataKey) : null;
+    return mapping?.imdb_id ? read(this.canonicalContentMetadataKey(type, mapping.imdb_id)) : null;
+  }
+
   // Track content requests (meta, search, catalog)
   async trackContentRequest(req) {
     // Skip metrics collection if disabled
@@ -298,10 +317,7 @@ class RequestTracker {
           const cleanContentKey = `${type}:${cleanId}`;
 
           // Track popular content using normalized key to prevent duplicates
-          redis
-            .zincrby(`popular_content:${today}`, 1, cleanContentKey)
-            .catch(() => {});
-          redis.expire(`popular_content:${today}`, 86400 * 30).catch(() => {}); // 30 days
+          metrics.zincr(`popular_content:${today}`, cleanContentKey, 86400 * 30);
         }
       }
 
@@ -322,8 +338,7 @@ class RequestTracker {
               /\/catalog\/[^/]+\/[^/]+\/(.*)\.(json|xml)$/i,
             );
             if (extrasMatch && extrasMatch[1]) {
-              const extrasPart = extrasMatch[1];
-              const segments = extrasPart.split("/");
+              const segments = extrasMatch[1].split(/[/&]/);
               for (const segment of segments) {
                 if (segment.toLowerCase().startsWith("search=")) {
                   const val = segment.substring("search=".length);
@@ -354,20 +369,11 @@ class RequestTracker {
           
           redis.set(dedupeKey, "1", "NX", "EX", 3)
             .then(setResult => {
-              if (setResult) {
-                // Increment global aggregate
-                Promise.all([
-                  redis.zincrby(`search_patterns:${today}`, 1, searchQuery),
-                  redis.expire(`search_patterns:${today}`, 86400 * 30),
-                ]).catch(() => {});
-              }
+              if (setResult) metrics.zincr(`search_patterns:${today}`, searchQuery, 86400 * 30);
             })
             .catch(() => {
               // On Redis error, fall back to naive increment
-              Promise.all([
-                redis.zincrby(`search_patterns:${today}`, 1, searchQuery),
-                redis.expire(`search_patterns:${today}`, 86400 * 30)
-              ]).catch(() => {});
+              metrics.zincr(`search_patterns:${today}`, searchQuery, 86400 * 30);
             });
         }
       }
@@ -400,8 +406,8 @@ class RequestTracker {
       // Convert to array and enrich with metadata
       const contentEntries = Array.from(contentMap.entries())
         .map(([contentKey, requests]) => {
-          const [type, id] = contentKey.split(":");
-          return { contentKey, type, id, requests };
+          const separator = contentKey.indexOf(":");
+          return { contentKey, type: contentKey.slice(0, separator), id: contentKey.slice(separator + 1), requests };
         })
         .sort((a, b) => b.requests - a.requests)
         .slice(0, limit);
@@ -416,14 +422,8 @@ class RequestTracker {
             const keyType = parts[0];
             const rawId = parts.slice(1).join(":");
             
-            const canonicalKey = this.canonicalContentMetadataKey(keyType, rawId);
-            let metadataStr = null;
-            try {
-              metadataStr = await redis.get(canonicalKey);
-            } catch (_) {}
-
-            if (metadataStr) {
-              const metadata = JSON.parse(metadataStr);
+            const metadata = await this.readContentMetadata(keyType, rawId);
+            if (metadata) {
               return {
                 id,
                 type: metadata.type || type,
@@ -508,11 +508,7 @@ class RequestTracker {
           const keyType = parts[0];
           const id = parts.slice(1).join(":");
 
-          let meta = null;
-          try {
-            const str = await redis.get(this.canonicalContentMetadataKey(keyType, id));
-            if (str) meta = JSON.parse(str);
-          } catch (_) {}
+          const meta = await this.readContentMetadata(keyType, id);
 
           return {
             id,
@@ -695,8 +691,7 @@ class RequestTracker {
     }
     try {
       const today = new Date().toISOString().split("T")[0];
-      redis.incr(`cache:hits:${today}`).catch(() => {});
-      redis.expire(`cache:hits:${today}`, 86400 * 30).catch(() => {});
+      metrics.incr(`cache:hits:${today}`, 86400 * 30);
     } catch (error) {
       logger.warn(
         "[Request Tracker] Failed to track cache hit:",
@@ -712,8 +707,7 @@ class RequestTracker {
     }
     try {
       const today = new Date().toISOString().split("T")[0];
-      redis.incr(`cache:misses:${today}`).catch(() => {});
-      redis.expire(`cache:misses:${today}`, 86400 * 30).catch(() => {});
+      metrics.incr(`cache:misses:${today}`, 86400 * 30);
     } catch (error) {
       logger.warn(
         "[Request Tracker] Failed to track cache miss:",
@@ -738,34 +732,17 @@ class RequestTracker {
       const hour = new Date().toISOString().substring(0, 13);
 
       // Track response times hourly
-      redis
-        .lpush(`provider_response_times:${provider}:${hour}`, responseTime)
-        .catch(() => {});
-      redis
-        .ltrim(`provider_response_times:${provider}:${hour}`, 0, 999)
-        .catch(() => {});
-      redis
-        .expire(`provider_response_times:${provider}:${hour}`, 3600 * 48)
-        .catch(() => {}); // 48 hours
+      metrics.push(`provider_response_times:${provider}:${hour}`, responseTime, 1000, 3600 * 48);
 
       // Track success/error rates
       if (success) {
-        redis.incr(`provider_success:${provider}:${today}`).catch(() => {});
+        metrics.incr(`provider_success:${provider}:${today}`, 86400 * 2);
       } else {
-        redis.incr(`provider_errors:${provider}:${today}`).catch(() => {});
+        metrics.incr(`provider_errors:${provider}:${today}`, 86400 * 2);
       }
-      redis
-        .expire(`provider_success:${provider}:${today}`, 86400 * 2)
-        .catch(() => {}); // 2 days
-      redis
-        .expire(`provider_errors:${provider}:${today}`, 86400 * 2)
-        .catch(() => {}); // 2 days
 
       // Track hourly calls for rate limiting awareness
-      redis.incr(`provider_calls:${provider}:${hour}`).catch(() => {});
-      redis
-        .expire(`provider_calls:${provider}:${hour}`, 3600 * 24)
-        .catch(() => {}); // 24 hours
+      metrics.incr(`provider_calls:${provider}:${hour}`, 3600 * 24);
 
       // Store real rate limit data if available
       if (rateLimitHeaders) {
@@ -974,10 +951,7 @@ class RequestTracker {
       };
 
       // Store in recent activity list (keep last 100 activities)
-      const activityKey = "recent_activity";
-      await redis.lpush(activityKey, JSON.stringify(activity));
-      await redis.ltrim(activityKey, 0, 99); // Keep only last 100
-      await redis.expire(activityKey, 86400 * 7); // 7 days
+      metrics.push("recent_activity", JSON.stringify(activity), 100, 86400 * 7);
 
       logger.debug(`[Request Tracker] Activity stored successfully: ${type}`);
     } catch (error) {
@@ -1507,18 +1481,8 @@ class RequestTracker {
         anonymizedIP: this.getAnonymizedIP(req),
       };
 
-      // Execute Redis operations in parallel
-      await Promise.all([
-        // Time window tracking
-        ...timeWindows.flatMap(window => [
-          redis.sadd(window.key, userIdentifier),
-          redis.expire(window.key, window.ttl)
-        ]),
-        // User activity tracking
-        redis.lpush("user_activities", JSON.stringify(userActivity)),
-        redis.ltrim("user_activities", 0, 999),
-        redis.expire("user_activities", 86400 * 7),
-      ]);
+      for (const window of timeWindows) metrics.add(window.key, userIdentifier, window.ttl);
+      metrics.push("user_activities", JSON.stringify(userActivity), 1000, 86400 * 7);
     } catch (error) {
       logger.warn(
         "[Request Tracker] Failed to track active user:",
