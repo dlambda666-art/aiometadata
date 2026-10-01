@@ -8,13 +8,11 @@ app_port: 3232
 pinned: false
 ---
 
-# AIOMetadata: The Ultimate Stremio Metadata Addon
+# ![AIOMETADATA](https://github.com/cedya77/aiometadata/blob/dev/public/logo.png) AIOMetadata: The Ultimate Stremio Metadata Addon
 
 **AIOMetadata** is a next-generation, power-user-focused metadata addon for [Stremio](https://www.stremio.com/). It aggregates and enriches movie, series, and anime metadata from multiple sources (TMDB, TVDB, MyAnimeList, AniList, IMDb, TVmaze, Fanart.tv, MDBList, and more), giving you full control over catalog sources, artwork, and search.
 
 ---
-
-<!-- Hugging Face sync trigger -->
 
 ## 🚀 Features
 
@@ -29,14 +27,183 @@ pinned: false
 - **Advanced ID Mapping**: Robust mapping between all major ID systems (MAL, TMDB, TVDB, IMDb, AniList, AniDB, Kitsu, TVmaze).
 - **Modern UI**: Intuitive React/Next.js configuration interface with drag-and-drop, tooltips, and instant feedback.
 
+---
+
 ## 🛠️ Installation
 
 ### 1. Hosted Instance
 
-Visit your hosted instance's `/configure` page.
-Configure your catalogs, providers, and preferences.
+Visit your hosted instance's `/configure` page.  
+Configure your catalogs, providers, and preferences.  
 Save your config and install the generated Stremio addon URL.
 
-### 2. Self-hosting
+### 2. Self-Hosting (Docker Compose)
 
-See the repository documentation and Docker configuration for self-hosting requirements.
+```yaml
+services:
+  aiometadata:
+    image: ghcr.io/cedya77/aiometadata:latest
+    container_name: aiometadata
+    restart: unless-stopped
+    ports:
+      - "3232:3232"  # Remove this if using Traefik
+    # expose:  # Uncomment if using Traefik
+    #   - 3232
+    init: true
+    env_file:
+      - .env
+    # labels:  # Optional: Remove if not using Traefik
+    #   - "traefik.enable=true"
+    #   - "traefik.http.routers.aiometadata.rule=Host(`${AIOMETADATA_HOSTNAME?}`)"
+    #   - "traefik.http.routers.aiometadata.entrypoints=websecure"
+    #   - "traefik.http.routers.aiometadata.tls.certresolver=letsencrypt"
+    #   - "traefik.http.routers.aiometadata.middlewares=authelia@docker"
+    #   - "traefik.http.services.aiometadata.loadbalancer.server.port=3232"
+    #   - "traefik.http.routers.aiometadata.service=aiometadata"
+    volumes:
+      - ${DOCKER_DATA_DIR}/aiometadata/data:/app/addon/data
+    depends_on:
+      aiometadata_redis:
+        condition: service_healthy
+    tty: true
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3232/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  aiometadata_redis:
+    image: redis:latest
+    container_name: aiometadata_redis
+    restart: unless-stopped
+    volumes:
+      - ${DOCKER_DATA_DIR}/aiometadata/cache:/data
+    command: redis-server --appendonly yes --save 3600 1
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  #aiometadata_postgres:
+  #  image: postgres:latest
+  #  container_name: aiometadata_postgres
+  #  restart: unless-stopped
+  #  environment:
+  #    - POSTGRES_DB=aiometadata
+  #    - POSTGRES_USER=postgres
+  #    - POSTGRES_PASSWORD=password
+  #  volumes:
+  #    - ${DOCKER_DATA_DIR}/aiometadata/postgres:/var/lib/postgresql/data
+  #  healthcheck:
+  #    test: ["CMD-SHELL", "pg_isready -U postgres -d aiometadata"]
+  #    interval: 10s
+  #    timeout: 5s
+  #    retries: 5
+```
+
+Create a `.env` file with your API keys and settings as shown in [.env.example](.env.example) 
+
+Then run:
+```bash
+docker compose up -d
+```
+
+### 3. Optional add-ons
+
+Two optional pieces of infrastructure have guides of their own, since neither is needed to run the addon:
+
+- **[Image Cache](docs/image-cache.md)** — serve artwork from disk instead of re-fetching it upstream.
+- **[Self-Hosted Jikan API](docs/self-hosted-jikan.md)** — run your own anime metadata source. The public Jikan API shuts down on **October 1, 2026**, so anyone relying on anime catalogs needs this.
+
+### 4. Sign-in with an identity provider (Optional)
+
+Let people sign in with an existing account instead of a UUID and password, and reach their saved configurations from the list. See **[Sign-in with an identity provider](docs/sso.md)**.
+
+### 5. Jellyfin server (Optional)
+
+Present a configuration as a Jellyfin server, so Jellyfin clients browse your catalogs and collections, play through your stream addon and keep Continue Watching, Next Up and watched state in step with your trackers. See **[Jellyfin server](docs/jellyfin.md)**.
+
+
+## ⚙️ Configuration
+
+- **Catalogs**: Add, remove, and reorder catalogs (TMDB, TVDB, MAL, AniList, MDBList, streaming, etc.).
+- **Providers**: Set preferred metadata and artwork provider for each type.
+- **Search**: Enable/disable search engines per type; enable AI search with Gemini API key.
+- **Integrations**: Connect MDBList and more for personal lists.
+- **Security**: Set user and (optional) addon password for config protection.
+
+All configuration is managed via the `/configure` UI and saved per-user (UUID) in the database.
+
+---
+
+## 🔌 API & Endpoints
+
+- `/stremio/:userUUID/:compressedConfig/manifest.json` — Stremio manifest (per-user config)
+- `/api/config/save` — Save user config (POST)
+- `/api/config/load/:userUUID` — Load user config (POST)
+- `/api/config/update/:userUUID` — Update user config (PUT)
+- `/api/config/is-trusted/:uuid` — Check if UUID is trusted (GET)
+- `/api/cache/*` — Cache health and admin endpoints
+- `/poster/:type/:id` — Poster proxy with fallback and RPDB support
+- `/resize-image` — Image resize proxy
+- `/api/image/blur` — Image blur proxy
+
+---
+
+## 🧩 Supported Providers
+
+- **Movies/Series**: TMDB, TVDB, IMDb, TVmaze
+- **Anime**: MyAnimeList (MAL), AniList, Kitsu, AniDB, TVDB, IMDb
+- **Artwork**: TMDB, TVDB, Fanart.tv, AniList, RPDB
+- **Personal Lists**: MDBList, MAL, AniList
+- **Streaming**: Netflix, Disney+, Amazon, and more (via TMDB watch providers)
+
+---
+
+## 🧑‍💻 Development
+
+```bash
+# Backend
+npm run dev:server
+
+# Frontend
+npm run dev
+```
+
+- Edit `/addon` for backend, `/configure` for frontend.
+- Uses Redis for caching, SQLite/PostgreSQL for config storage.
+
+---
+
+## 🤝 Contributing
+
+We welcome community contributions! However, to keep review times manageable, we have specific guidelines. **Please read the [CONTRIBUTING.md](docs/contributing.md) guide before opening issues or pull requests.**
+
+---
+
+## 📄 License
+
+GPL-3.0 — see [LICENSE](LICENSE).
+
+---
+
+## 🙏 Credits
+
+- [Stremio](https://www.stremio.com/)
+- [TMDB](https://www.themoviedb.org/)
+- [TVDB](https://thetvdb.com/)
+- [MyAnimeList](https://myanimelist.net/)
+- [AniList](https://anilist.co/)
+- [Fanart.tv](https://fanart.tv/)
+- [MDBList](https://mdblist.com/)
+- [RPDB](https://rpdb.net/)
+
+**Special thanks to [MrCanelas](https://github.com/mrcanelas), the original developer of the TMDB Addon for Stremio, whose work inspired and laid the groundwork for this project.**
+
+---
+
+## ⚠️ Disclaimer
+
+This addon aggregates metadata from third-party sources. Data accuracy and availability are not guaranteed.
