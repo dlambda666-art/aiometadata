@@ -1,5 +1,5 @@
 import { LRUCache } from 'lru-cache';
-import { withEpisodeOrder } from '../utils/episodeOrder';
+import { readsBySeason, withEpisodeOrder } from '../utils/episodeOrder';
 import type { MetaHashEntry } from './metaHashStore';
 const redis: any = require('./redisClient');
 const { loadConfigFromDatabase }: any = require('./configApi');
@@ -935,6 +935,7 @@ function getMetaCacheContext(config: any, metaId: string, type: string | null, u
         useImdbIdForCatalogAndSearch: config.mal?.useImdbIdForCatalogAndSearch || false,
       },
       ...(context.metaProvider === 'tvdb' ? { tvdbSeasonType: config.tvdbSeasonType || 'default' } : {}),
+      ...(context.metaProvider === 'tvdb' && readsBySeason(config.tvdbSeasonType) ? { episodeSource: 'seasons' } : {}),
     };
   } else if (type === 'movie') {
     context.metaProvider = config.providers?.movie || 'tmdb';
@@ -967,6 +968,7 @@ function getMetaCacheContext(config: any, metaId: string, type: string | null, u
     };
     context.videoOptions = {
       tvdbSeasonType: config.tvdbSeasonType || 'default',
+      ...(readsBySeason(config.tvdbSeasonType) ? { episodeSource: 'seasons' } : {}),
       forceAnimeForDetectedImdb: config.providers?.forceAnimeForDetectedImdb || false,
       ...(config.providers?.forceAnimeForDetectedImdb
         ? {
@@ -1530,6 +1532,10 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
       order: pickOrder(config, idOnly),
       minVotes: voteFloor(config, idOnly),
     };
+  }
+
+  if (catalogFromConfig?.metadata?.useUpstreamArt === true) {
+    catalogConfig.upstreamArt = true;
   }
 
   const catalogConfigString = JSON.stringify(catalogConfig);
