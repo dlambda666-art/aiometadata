@@ -1,9 +1,15 @@
 name: Sync to Hugging Face
 
+# Envoie la branche dev sur le Space Lambda666/AIOMeta.
+# `hf upload` gère les images (le push git direct de hub-sync était refusé
+# par Hugging Face à cause des fichiers binaires).
 on:
   push:
     branches: [dev]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   sync:
@@ -14,14 +20,18 @@ jobs:
         with:
           ref: dev
 
-      - name: Sync repository to Hugging Face
-        uses: huggingface/hub-sync@v0.1.0
-        with:
-          github_repo_id: dlambda666-art/aiometadata
-          huggingface_repo_id: Lambda666/AIOMeta
-          hf_token: ${{ secrets.HF_TOKEN }}
-          repo_type: space
-          space_sdk: gradio
-          private: false
+      - name: Install Hugging Face CLI
+        run: pip install -U huggingface_hub
 
-# trigger sync
+      - name: Sync repository to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          hf upload \
+            Lambda666/AIOMeta \
+            . \
+            --repo-type space \
+            --exclude=".git*" \
+            --exclude=".github*" \
+            --delete="*" \
+            --commit-message="Sync from GitHub"
