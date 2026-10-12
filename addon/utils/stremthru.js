@@ -184,7 +184,15 @@ async function getGenresFromStremThruCatalog(items) {
   }
 }
 
-async function parseStremThruItems(items, type, genreFilter, language, config, includeVideos = false) {
+function _withUpstreamArt(meta, item) {
+  const art = {};
+  for (const field of ['poster', 'background', 'logo']) {
+    if (typeof item?.[field] === 'string' && item[field]) art[field] = item[field];
+  }
+  return Object.keys(art).length ? { ...meta, ...art } : meta;
+}
+
+async function parseStremThruItems(items, type, genreFilter, language, config, includeVideos = false, options = {}) {
   const animeProviders = new Set(['mal', 'kitsu', 'anidb', 'anilist']);
   logger.debug(`Processing ${items.length} items (type: ${type}, genre: ${genreFilter || 'all'})`);
   const metaPromises = items.map(async item => {
@@ -209,10 +217,15 @@ async function parseStremThruItems(items, type, genreFilter, language, config, i
       } else {
         meta = await _processStandardItem(item, provider, language, config, includeVideos);
       }
-      return meta || _createFallbackMeta(item, language, config);
+      
+      // If a processor returns null (e.g., anime mapping failed), use the fallback.
+      const result = meta || _createFallbackMeta(item, language, config);
+      return options.upstreamArt ? _withUpstreamArt(result, item) : result;
+
     } catch (error) {
       logger.error(`Error processing item ${item.id}:`, error.message);
-      return _createFallbackMeta(item, language, config);
+      const fallback = _createFallbackMeta(item, language, config);
+      return options.upstreamArt ? _withUpstreamArt(fallback, item) : fallback;
     }
   });
   const metas = await Promise.all(metaPromises);
