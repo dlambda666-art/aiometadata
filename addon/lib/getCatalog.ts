@@ -29,6 +29,7 @@ const { getSetting }: any = require('./settingsService');
 import { resolveDynamicTmdbDiscoverParams } from './tmdbDiscoverDateTokens.js';
 import { roundRobinInterleaveTagged, mergedDedupKey, filterMetasByGenre, normalizeGenreKey } from '../utils/mergedCatalog.js';
 const { getTvmazeScheduleCatalog } = require('./tvmazeScheduleCatalog');
+const { getServerWatchlistCatalog, isServerWatchlistCatalog } = require('./serverWatchlist');
 const movielens = require('./movielens');
 
 const consola = require('consola');
@@ -90,6 +91,9 @@ async function getCatalog(type: string, language: string, page: number, id: stri
       logger.debug(`Routing to Trakt catalog handler for id: ${id}`);
       const traktResults = await getTraktCatalog(type, id, genre, page, language, config, userUUID, includeVideos);
       return { metas: traktResults };
+    }
+    else if (jikan.isJikanCatalogId(id) && !jikan.isJikanEnabled()) {
+      return { metas: [] };
     }
     else if (id.startsWith('mal.discover.')) {
       logger.debug(`Routing to MAL discover catalog handler for id: ${id}`);
@@ -156,6 +160,9 @@ async function getCatalog(type: string, language: string, page: number, id: stri
       logger.debug(`Routing to PublicMetaDB catalog handler for id: ${id}`);
       const pmdbResults = await getPublicMetaDBCatalog(type, id, page, language, config, userUUID);
       return { metas: pmdbResults };
+    }
+    else if (isServerWatchlistCatalog(id)) {
+      return { metas: await getServerWatchlistCatalog(id, type, page, config, userUUID) };
     }
     else if (id.startsWith('merged.')) {
       logger.debug(`Routing to Merged catalog handler for id: ${id}`);
@@ -1914,7 +1921,7 @@ async function getExternalAddonCatalog(type: string, catalogId: string, genre: s
     // Filter here (not at the catalog route) so the pagination cursor below counts
     // post-filter items. The route detects this via filtersAlreadyApplied and skips re-filtering.
     const { applyCatalogFilters, catalogFiltersActive } = require('../utils/catalogFilters.js');
-    const { fillMaxPages } = require('./catalogPagination');
+    const { fillMaxPages, cursorTtlSeconds } = require('./catalogPagination');
 
     const sourceKey = createHash('sha256').update(String(catalogUrl)).digest('hex').slice(0, 16);
     const readBatch = async (offset: number) => {
@@ -1960,7 +1967,7 @@ async function getExternalAddonCatalog(type: string, catalogId: string, genre: s
         cursorKey,
         JSON.stringify({ served: newServed, upstreamOffset: offset, seenIds: recentIds }),
         'EX',
-        catalogTTL
+        catalogTTL > 0 ? catalogTTL : cursorTtlSeconds()
       );
     }
 

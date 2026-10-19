@@ -64,7 +64,7 @@ export interface CatalogConfig {
   type: 'movie' | 'series' | 'anime' | 'all';
   enabled: boolean;
   tags?: string[];
-  source: 'tmdb' | 'tvdb' | 'mal' | 'tvmaze' | 'mdblist' | 'trakt' | 'streaming' | 'stremthru' | 'custom' | 'anilist' | 'letterboxd' | 'simkl' | 'movielens' | 'flixpatrol' | 'publicmetadb' | 'recommendations' | 'merged' | 'lumiere'; // Keep source as the display label
+  source: 'tmdb' | 'tvdb' | 'mal' | 'tvmaze' | 'mdblist' | 'trakt' | 'streaming' | 'stremthru' | 'custom' | 'anilist' | 'letterboxd' | 'simkl' | 'movielens' | 'flixpatrol' | 'publicmetadb' | 'recommendations' | 'merged' | 'lumiere' | 'aiom'; // Keep source as the display label
   sourceUrl?: string; // Store the actual URL for StremThru and custom catalogs
   showInHome: boolean;
   genres?: string[]; // Optional genres array for catalogs that support genre filtering
@@ -225,6 +225,7 @@ export interface AppConfig {
   hideErrors?: boolean;
   castCount: number;
   displayAgeRating: boolean;
+  contentRatingCountry?: string;
   providers: {
     movie: string;
     series: string;
@@ -253,11 +254,15 @@ export interface AppConfig {
     originalLangFallback: boolean;
   };
   tvdbSeasonType: string;
+  animeEpisodeDates?: 'provider' | 'earliest' | 'dub';
   tvdbEpisodeOrders?: Record<string, string>;
+  tvdbNormalizeYearSeasons?: boolean;
+  tvdbShowSeasonNumbering?: Record<string, 'years' | 'sequential'>;
   mal: {
     skipFiller: boolean;
     skipRecap: boolean;
     allowEpisodeMarking: boolean;
+    skipMixedFiller?: boolean;
     /** If true, prefer IMDb IDs for catalog and search items when available */
     useImdbIdForCatalogAndSearch?: boolean;
   };
@@ -374,7 +379,7 @@ export interface AppConfig {
   timezone?: string;
   catalogs: CatalogConfig[];
   deletedCatalogs?: string[];
-  /** Collections and rows built in the Collections editor, exported as Nuvio or Fusion JSON */
+  /** Collections and rows built in the Collections editor, served to Jellyfin clients and exported as Nuvio JSON */
   collections?: BuilderEntry[];
   /** Serve the collection layout's images through this instance's image cache. */
   collectionImagesViaCache?: boolean;
@@ -437,6 +442,9 @@ export interface AppConfig {
   /** Install URL of a stream addon the Jellyfin server delegates playback to. */
   jellyfinStreamUrl?: string;
   jellyfinResolveOnOpen?: boolean;
+  jellyfinUpcomingMode?: 'airing';
+  /** Where a title's similar titles come from. TMDB when unset. */
+  jellyfinSimilarSource?: 'simkl';
   jellyfinLatestRows?: boolean;
   jellyfinMarkUnaired?: boolean;
   /** Playback is reported by the client, so the subtitle trigger is not used. */
@@ -448,6 +456,8 @@ export interface AppConfig {
   /** Name and picture of the main Jellyfin user, the configuration itself. */
   jellyfinUserName?: string;
   jellyfinUserAvatar?: string;
+  /** The main user's PIN: 4 to 12 digits as typed, or the hash the server saved it as. */
+  jellyfinUserPin?: string;
   jellyfinUserTags?: string[];
   jellyfinUserHandoffNames?: string[];
   jellyfinSkipSource?: SkipSource;

@@ -25,6 +25,7 @@ const EXTENSIONS = {
   versions: 1,
   genreRequired: 1,
   ranked: 1,
+  watchlistFavorites: 1,
 } as const;
 
 export function extensionInfo(origin: string): any {
@@ -65,6 +66,10 @@ export function systemInfo(serverId: string, localAddress: string): any {
 export function userConfiguration(): any {
   return {
     PlayDefaultAudioTrack: true,
+    AudioLanguages: [],
+    SubtitleLanguages: [],
+    SubtitleTypes: [],
+    ListPreferredSubtitlesOnly: false,
     SubtitleLanguagePreference: '',
     DisplayMissingEpisodes: false,
     GroupedFolders: [],

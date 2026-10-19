@@ -656,8 +656,9 @@ class DashboardAPI {
         },
         {
           name: "MAL",
-          keyStatus: null, // Doesn't require API key
+          keyStatus: require('./mal').isJikanEnabled() ? null : "Disabled",
           requiresKey: false,
+          off: !require('./mal').isJikanEnabled(),
         },
         {
           name: "Kitsu",
@@ -727,7 +728,7 @@ class DashboardAPI {
             // Determine health status based purely on success/failure metrics
             let status = "healthy";
             
-            if (totalCalls === 0) {
+            if (totalCalls === 0 || provider.off) {
               status = "unknown";
             } else if (totalCalls >= minCalls) {
               if (successRate < 50) {
@@ -1714,6 +1715,100 @@ class DashboardAPI {
           lastRun: "Unknown",
           description: "Backfills MAL/AniList/Kitsu/AniDB ids the anime list no longer receives",
           nextRun: "Now",
+          action: "restart",
+          category: "mapping"
+        });
+      }
+
+      // 14. Filler data
+      try {
+        const { getFillerDataStats } = require('./fillerData');
+        const fillerStats = getFillerDataStats();
+        const status = !fillerStats.enabled
+          ? "disabled"
+          : fillerStats.running
+            ? "running"
+            : fillerStats.lastError
+              ? "error"
+              : fillerStats.loaded ? "completed" : "scheduled";
+
+        let nextRunDisplay = "Disabled";
+        if (fillerStats.enabled) {
+          const nextRunTime = (fillerStats.lastCheck || 0) + fillerStats.refreshHours * 60 * 60 * 1000;
+          nextRunDisplay = nextRunTime > Date.now() ? this.getTimeUntil(new Date(nextRunTime)) : "On next request";
+        }
+        const detail = fillerStats.lastError
+          ? `last refresh failed: ${fillerStats.lastError}`
+          : `${fillerStats.anime.toLocaleString()} anime${fillerStats.generated ? `, file built ${this.getTimeAgo(new Date(fillerStats.generated))}` : ""}`;
+
+        tasks.push({
+          id: 14,
+          name: "Update Filler Data",
+          status,
+          lastRun: fillerStats.lastRefreshAt ? this.getTimeAgo(new Date(fillerStats.lastRefreshAt)) : "Never",
+          description: `Filler, mixed canon/filler and recap episodes for anime (${detail})`,
+          nextRun: nextRunDisplay,
+          action: fillerStats.enabled ? "restart" : null,
+          category: "mapping"
+        });
+      } catch (error) {
+        logger.warn("Failed to get filler data status:", error.message);
+        tasks.push({
+          id: 14,
+          name: "Update Filler Data",
+          status: "error",
+          lastRun: "Unknown",
+          description: "Filler, mixed canon/filler and recap episodes for anime",
+          nextRun: "Unknown",
+          action: "restart",
+          category: "mapping"
+        });
+      }
+
+      // 13. Anime release schedule (AniSchedule), refreshed in memory as requests arrive
+      try {
+        const { getAnimeScheduleStats } = require('./animeAiringSchedule');
+        const scheduleStats = getAnimeScheduleStats();
+        const status = !scheduleStats.enabled
+          ? "disabled"
+          : scheduleStats.running
+            ? "running"
+            : scheduleStats.lastError
+              ? "error"
+              : scheduleStats.loaded ? "completed" : "scheduled";
+
+        let nextRunDisplay = "Disabled";
+        if (scheduleStats.enabled) {
+          const nextRunTime = (scheduleStats.lastCheck || 0) + scheduleStats.refreshMinutes * 60 * 1000;
+          nextRunDisplay = nextRunTime > Date.now() ? this.getTimeUntil(new Date(nextRunTime)) : "On next request";
+        }
+
+        const source = scheduleStats.sourceUpdatedAt
+          ? `, source updated ${this.getTimeAgo(new Date(scheduleStats.sourceUpdatedAt))}${scheduleStats.stale ? ", stale: earliest times read from AniList" : ""}`
+          : "";
+        const detail = scheduleStats.lastError
+          ? `last refresh failed: ${scheduleStats.lastError}`
+          : `${scheduleStats.anime.toLocaleString()} anime, ${scheduleStats.dubbed.toLocaleString()} with dub times${source}`;
+
+        tasks.push({
+          id: 13,
+          name: "Update Anime Release Schedule",
+          status,
+          lastRun: scheduleStats.lastRefreshAt ? this.getTimeAgo(new Date(scheduleStats.lastRefreshAt)) : "Never",
+          description: `Earliest release and English dub times for anime episodes (${detail})`,
+          nextRun: nextRunDisplay,
+          action: scheduleStats.enabled ? "restart" : null,
+          category: "mapping"
+        });
+      } catch (error) {
+        logger.warn("Failed to get anime release schedule status:", error.message);
+        tasks.push({
+          id: 13,
+          name: "Update Anime Release Schedule",
+          status: "error",
+          lastRun: "Unknown",
+          description: "Earliest release and English dub times for anime episodes",
+          nextRun: "Unknown",
           action: "restart",
           category: "mapping"
         });
