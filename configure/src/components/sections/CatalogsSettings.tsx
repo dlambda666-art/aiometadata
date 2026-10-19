@@ -22,6 +22,7 @@ import { AICatalogDialog } from '@/components/AICatalogDialog';
 import { CacheTTLField } from '@/components/CacheTTLField';
 import { useConfig } from '@/contexts/ConfigContext';
 import type { CatalogConfig } from '@/contexts/config';
+import { mergedSourcesShape } from '@/lib/posterShape';
 import { DndContext, closestCenter, KeyboardSensor, PointerSensor, TouchSensor, useSensor, useSensors, DragEndEvent } from '@dnd-kit/core';
 import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
@@ -39,7 +40,7 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { streamingServices, regions } from "@/data/streamings";
 import { consumeCollectionBuilderRequest } from '@/lib/settingsRoute';
-import { allCatalogDefinitions } from '@/data/catalogs';
+import { allCatalogDefinitions, isJikanCatalog } from '@/data/catalogs';
 import { resolveCatalogTTL, minCacheTTLFor, hasEditableCacheTTL, formatTTL } from '@/lib/catalogTTL';
 import { GenreSelection } from '@/data/genres';
 import { SelectionProvider, useSelection } from '@/contexts/SelectionContext';
@@ -1867,7 +1868,7 @@ const CustomManifestSettingsDialog = ({ catalog, isOpen, onClose }: { catalog: C
             value={cacheTTL}
             onChange={setCacheTTL}
             min={minCacheTTLFor(catalog.id)}
-            help="How long to cache this catalog before refreshing. Range: 5 minutes to 7 days."
+            help="How long to cache this catalog before refreshing, up to 7 days. 0 turns caching off."
           />
           <div className="space-y-2">
             <div className="flex items-center justify-between">
@@ -2492,6 +2493,8 @@ const GenericSettingsDialog = ({ catalog, isOpen, onClose }: { catalog: CatalogC
   const [hideUnreleasedDigital, setHideUnreleasedDigital] = useState<string>(catalog.metadata?.hideUnreleasedDigital === true ? 'on' : catalog.metadata?.hideUnreleasedDigital === false ? 'off' : 'global');
   const [hideUnreleasedShows, setHideUnreleasedShows] = useState<string>(catalog.metadata?.hideUnreleasedShows === true ? 'on' : catalog.metadata?.hideUnreleasedShows === false ? 'off' : 'global');
   const isRecommendations = (catalog as CatalogConfig & { source?: string }).source === 'recommendations';
+  const isServerWatchlist = catalog.id.startsWith('aiom.watchlist.');
+  const [serverSort, setServerSort] = useState<string>(catalog.sort || 'added');
   const [pickOrder, setPickOrder] = useState<string>(catalog.metadata?.pickOrder || 'global');
   const [pickMinVotes, setPickMinVotes] = useState<string>(
     catalog.metadata?.pickMinVotes === undefined || catalog.metadata?.pickMinVotes === null
@@ -2514,6 +2517,7 @@ const GenericSettingsDialog = ({ catalog, isOpen, onClose }: { catalog: CatalogC
         c.id === catalog.id && c.type === catalog.type
           ? {
             ...c,
+            ...(isServerWatchlist ? { sort: serverSort as CatalogConfig['sort'] } : {}),
             metadata: {
               ...c.metadata, posterShape: posterShape === 'landscape' ? 'landscape' : undefined,
               hideWatchedTrakt: hideTraktValue,
@@ -2545,6 +2549,20 @@ const GenericSettingsDialog = ({ catalog, isOpen, onClose }: { catalog: CatalogC
           <DialogTitle>{catalog.name} Settings</DialogTitle>
         </DialogHeader>
         <div className="space-y-4 py-4">
+          {isServerWatchlist && (
+            <div className="space-y-2">
+              <Label>Sort</Label>
+              <Select value={serverSort} onValueChange={setServerSort}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="added">Date added, newest first</SelectItem>
+                  <SelectItem value="released">Release date, newest first</SelectItem>
+                  <SelectItem value="title">Title, A to Z</SelectItem>
+                  <SelectItem value="imdbrating">Rating, highest first</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          )}
           {isRecommendations && (
             <>
               <div className="space-y-2">
@@ -2713,6 +2731,13 @@ const MergedCatalogCard = ({
   const [newType, setNewType] = useState(catalog.displayType || catalog.type);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsMergeMode, setSettingsMergeMode] = useState<'interleaved' | 'sequential' | 'alternating'>(catalog.metadata?.mergeMode || 'interleaved');
+  const [settingsPosterShape, setSettingsPosterShape] = useState<'inherit' | 'poster' | 'landscape'>(catalog.metadata?.posterShape || 'inherit');
+  const sourcesShape = mergedSourcesShape(catalog, allCatalogs);
+  const openSettings = () => {
+    setSettingsMergeMode(catalog.metadata?.mergeMode || 'interleaved');
+    setSettingsPosterShape(catalog.metadata?.posterShape || 'inherit');
+    setShowSettings(true);
+  };
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -2894,7 +2919,7 @@ const MergedCatalogCard = ({
                         <Shuffle className={`h-4 w-4 mr-2 ${catalog.randomizePerPage && catalog.enabled ? 'text-purple-400' : 'text-muted-foreground'}`} />
                         {catalog.randomizePerPage ? 'Original Order' : 'Randomize Order'}
                       </DropdownMenuItem>
-                      <DropdownMenuItem onClick={() => { setSettingsMergeMode(catalog.metadata?.mergeMode || 'interleaved'); setShowSettings(true); }}>
+                      <DropdownMenuItem onClick={openSettings}>
                         <Settings className="h-4 w-4 mr-2 text-muted-foreground" />
                         Merge Settings
                       </DropdownMenuItem>
@@ -2995,7 +3020,7 @@ const MergedCatalogCard = ({
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button variant="ghost" size="icon" onClick={() => { setSettingsMergeMode(catalog.metadata?.mergeMode || 'interleaved'); setShowSettings(true); }} className="h-8 w-8 active:scale-90 transition-transform">
+                <Button variant="ghost" size="icon" onClick={openSettings} className="h-8 w-8 active:scale-90 transition-transform">
                   <Settings className="h-5 w-5 text-muted-foreground hover:text-foreground" />
                 </Button>
               </TooltipTrigger>
@@ -3078,10 +3103,24 @@ const MergedCatalogCard = ({
                 </SelectContent>
               </Select>
             </div>
+            <div className="space-y-2">
+              <Label>Poster Shape</Label>
+              <Select value={settingsPosterShape} onValueChange={(v: 'inherit' | 'poster' | 'landscape') => setSettingsPosterShape(v)}>
+                <SelectTrigger className="mt-1">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="inherit">Match sources (currently {sourcesShape === 'landscape' ? 'Landscape' : 'Poster'})</SelectItem>
+                  <SelectItem value="poster">Poster</SelectItem>
+                  <SelectItem value="landscape">Landscape</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">Match sources is Landscape only when every source catalog is landscape. Jellyfin clients keep their own card shapes.</p>
+            </div>
             <div className="flex justify-end gap-2">
               <Button variant="outline" onClick={() => setShowSettings(false)}>Cancel</Button>
               <Button onClick={() => {
-                updateCatalog(c => ({ ...c, metadata: { ...c.metadata, mergeMode: settingsMergeMode } }));
+                updateCatalog(c => ({ ...c, metadata: { ...c.metadata, mergeMode: settingsMergeMode, posterShape: settingsPosterShape === 'inherit' ? undefined : settingsPosterShape } }));
                 setShowSettings(false);
               }}>Save</Button>
             </div>
@@ -4121,7 +4160,7 @@ function CatalogsSettingsContent({
   collectionFilter: CollectionFilter;
   setCollectionFilter: React.Dispatch<React.SetStateAction<CollectionFilter>>;
 }) {
-  const { config, setConfig, hasBuiltInTvdb, hasBuiltInGemini, lumiereEnabled } = useConfig();
+  const { config, setConfig, hasBuiltInTvdb, hasBuiltInGemini, lumiereEnabled, jikanEnabled } = useConfig();
   const {
     selectAll,
     deselectAll,
@@ -4325,6 +4364,7 @@ function CatalogsSettingsContent({
       if (cat.source === 'tvdb' && !hasTvdbKey) return false;
 
       if (cat.source === 'lumiere' && !lumiereEnabled) return false;
+      if (!jikanEnabled && isJikanCatalog(cat)) return false;
 
       // Filter by selected tags (match any)
       if (tagFilters.length > 0 && !tagFilters.some(t => cat.tags?.includes(t))) return false;
@@ -4333,7 +4373,7 @@ function CatalogsSettingsContent({
       const serviceId = cat.id.replace("streaming.", "").replace(/ .*/, "");
       return Array.isArray(config.streaming) && config.streaming.includes(serviceId);
     }),
-    [config.catalogs, config.streaming, hideDisabledCatalogs, hasTvdbKey, lumiereEnabled, tagFilters]
+    [config.catalogs, config.streaming, hideDisabledCatalogs, hasTvdbKey, lumiereEnabled, jikanEnabled, tagFilters]
   );
 
   const collectionCounts = useMemo(() => {
@@ -4843,7 +4883,9 @@ function CatalogsSettingsContent({
     setLoadingAction(shape === 'landscape' ? 'setLandscape' : 'setPoster');
 
     try {
-      const toChange = selectedCatalogs.filter(catalog => (catalog.metadata?.posterShape === 'landscape') !== (shape === 'landscape'));
+      const toChange = selectedCatalogs.filter(catalog => catalog.source === 'merged'
+        ? catalog.metadata?.posterShape !== shape
+        : (catalog.metadata?.posterShape === 'landscape') !== (shape === 'landscape'));
       const keys = new Set(toChange.map(cat => `${cat.id}-${cat.type}`));
 
       if (keys.size > 0) {
@@ -4851,7 +4893,7 @@ function CatalogsSettingsContent({
           ...prev,
           catalogs: prev.catalogs.map(c =>
             keys.has(`${c.id}-${c.type}`)
-              ? { ...c, metadata: { ...c.metadata, posterShape: shape === 'landscape' ? 'landscape' : undefined } }
+              ? { ...c, metadata: { ...c.metadata, posterShape: shape === 'landscape' || c.source === 'merged' ? shape : undefined } }
               : c
           )
         }));
@@ -6340,7 +6382,7 @@ function CatalogsSettingsContent({
 // ...existing code...
 
 export function CatalogsSettings() {
-  const { config, hasBuiltInTvdb, setConfig, lumiereEnabled } = useConfig();
+  const { config, hasBuiltInTvdb, setConfig, lumiereEnabled, jikanEnabled } = useConfig();
   const [hideDisabledCatalogs, setHideDisabledCatalogs] = useState(config.showDisabledCatalogs ?? false);
   const [tagFilters, setTagFilters] = useState<string[]>([]);
   const [collectionFilter, setCollectionFilter] = useState<CollectionFilter>('all');
@@ -6371,6 +6413,7 @@ export function CatalogsSettings() {
       if (cat.source === 'tvdb' && !hasTvdbKey) return false;
 
       if (cat.source === 'lumiere' && !lumiereEnabled) return false;
+      if (!jikanEnabled && isJikanCatalog(cat)) return false;
 
       // Filter by selected tags (match any)
       if (tagFilters.length > 0 && !tagFilters.some(t => cat.tags?.includes(t))) return false;
@@ -6384,7 +6427,7 @@ export function CatalogsSettings() {
       const serviceId = cat.id.replace("streaming.", "").replace(/ .*/, "");
       return Array.isArray(config.streaming) && config.streaming.includes(serviceId);
     }),
-    [config.catalogs, config.streaming, hideDisabledCatalogs, hasTvdbKey, lumiereEnabled, tagFilters, collectionFilter, collectedKeys]
+    [config.catalogs, config.streaming, hideDisabledCatalogs, hasTvdbKey, lumiereEnabled, jikanEnabled, tagFilters, collectionFilter, collectedKeys]
   );
 
   return (

@@ -8,7 +8,9 @@ import { EMPTY_USER_DATA } from './dto';
 import { placeholderSources } from './streams';
 import redis from '../redisClient';
 import type { CatalogRef } from './views';
-import { viewerAccountOwner, viewerMarksUnaired, viewerReadsExtensions } from './viewer';
+import { viewerAccountOwner, viewerMarksUnaired, viewerProfile, viewerReadsExtensions } from './viewer';
+import { SERVER_WATCHLIST_PREFIX } from '../serverWatchlist';
+import { isLandscapeCatalogConfig } from '../../utils/catalogPosterShape';
 
 const logger = consola.withTag('Jellyfin');
 
@@ -104,7 +106,7 @@ function queueImageWrite(hash: string, field: string, value: string): void {
   scheduleImageFlush();
 }
 
-function rememberArt(scope: string, url: string | undefined): void {
+export function rememberArt(scope: string, url: string | undefined): void {
   if (!url) return;
   const tag = imageTag(url);
   const key = `${scope}|${tag}`;
@@ -274,7 +276,8 @@ const catalogLengths = new LRUCache<string, number>({
 
 function lengthKeyFor(userUUID: string, catalog: CatalogRef, extras: Record<string, string>, tags: string[], keepKey = ''): string {
   const owner = viewerAccountOwner();
-  return `${userUUID}|${catalog.type}|${catalog.id}|${extras.genre ?? ''}|${extras.search ?? ''}|${tags.join(',')}|${keepKey}${owner ? `|@${owner}` : ''}`;
+  const viewer = catalog.id.startsWith(SERVER_WATCHLIST_PREFIX) ? viewerProfile() : '';
+  return `${userUUID}|${catalog.type}|${catalog.id}|${extras.genre ?? ''}|${extras.search ?? ''}|${tags.join(',')}|${keepKey}${owner ? `|@${owner}` : ''}${viewer ? `|#${viewer}` : ''}`;
 }
 
 export function knownCatalogLength(userUUID: string, catalog: CatalogRef, extras: Record<string, string> = {}, tags: string[] = [], keepKey = ''): number | undefined {
@@ -543,7 +546,7 @@ function externalUrls(ids: Record<string, string>, show: boolean): Array<{ Name:
 const CONTINUING = new Set(['continuing', 'returning series', 'running', 'ongoing', 'currently_airing', 'current']);
 const ENDED = new Set(['ended', 'canceled', 'cancelled', 'finished_airing', 'finished']);
 
-function seriesStatus(meta: any): 'Continuing' | 'Ended' | undefined {
+export function seriesStatus(meta: any): 'Continuing' | 'Ended' | undefined {
   const status = String(meta.status ?? '').trim().toLowerCase();
   if (CONTINUING.has(status)) return 'Continuing';
   if (ENDED.has(status)) return 'Ended';
@@ -561,7 +564,9 @@ function endDate(meta: any): string | null {
 function peopleFrom(meta: any, serverId: string): any[] {
   const extras = meta.app_extras || {};
   const person = (member: any, type: string, role: string) => {
-    const id = encodeJellyfinId({ k: 'person', n: String(member?.name || '') });
+    const source = Number(member?.tvdbId) > 0 ? { s: 'tvdb' as const, x: Number(member.tvdbId) }
+      : Number(member?.tmdbId) > 0 ? { s: 'tmdb' as const, x: Number(member.tmdbId) } : {};
+    const id = encodeJellyfinId({ k: 'person', n: String(member?.name || ''), ...source });
     // A client only asks for a portrait when the tag is present, so registering
     // the photo and setting it have to happen together.
     if (member?.photo) rememberImages(serverId, id, { primary: member.photo });
@@ -576,6 +581,13 @@ function peopleFrom(meta: any, serverId: string): any[] {
 
   const seen = new Set<string>();
   return people.filter((p: any) => p.Name && !seen.has(`${p.Type}|${p.Id}`) && seen.add(`${p.Type}|${p.Id}`));
+}
+
+export function originalLanguage(meta: any): string | null {
+  const { languageCode } = require('./streams');
+  const { subtitleLanguage } = require('./subtitles');
+  const raw = meta?._originalLanguage || meta?._providerArt?.originalLanguage || (meta?._providerArt?.anime ? 'ja' : null);
+  return raw ? subtitleLanguage(String(raw), languageCode) || null : null;
 }
 
 // A direct video link plays in the client's own player, so those go first.
@@ -638,11 +650,12 @@ export function metaToBaseItem(
   const kind = itemType === 'Series' ? 'series' : 'movie';
   const id = encodeJellyfinId({ k: kind, t: mediaType, i: String(meta.id) });
 
+  const wide = meta.posterShape === 'landscape' && Boolean(meta.poster);
   const images: ItemImages = {
     primary: meta.poster || undefined,
     backdrop: meta.background || undefined,
     logo: meta.logo || undefined,
-    thumb: meta.landscapePoster || undefined,
+    thumb: (wide ? meta.poster : meta.landscapePoster) || undefined,
   };
   rememberImages(serverId, id, images);
 
@@ -650,6 +663,7 @@ export function metaToBaseItem(
   if (images.primary) imageTags.Primary = imageTag(images.primary);
   if (images.logo) imageTags.Logo = imageTag(images.logo);
   if (images.thumb) imageTags.Thumb = imageTag(images.thumb);
+  if (wide) imageTags.Primary = wideTag(imageTags.Thumb);
   const ids = providerIds(meta);
 
   return {
@@ -681,12 +695,13 @@ export function metaToBaseItem(
     Tags: Array.isArray(meta.keywords) ? meta.keywords : [],
     Taglines: [],
     RemoteTrailers: remoteTrailers(meta),
+    OriginalLanguage: originalLanguage(meta),
     ImageTags: imageTags,
     BackdropImageTags: images.backdrop ? [imageTag(images.backdrop)] : [],
     ImageBlurHashes: {},
     UserData: { ...EMPTY_USER_DATA, Key: id, ItemId: id },
     LocationType: 'FileSystem',
-    PrimaryImageAspectRatio: itemType === 'Movie' ? 0.6666666666666666 : 0.6666666666666666,
+    PrimaryImageAspectRatio: wide ? 16 / 9 : 0.6666666666666666,
     CanDelete: false,
     CanDownload: itemType === 'Movie',
     PlayAccess: 'Full',
@@ -710,7 +725,7 @@ function catalogSettingsFor(config: any, catalog: { id: string; type: string }):
 }
 
 export function isLandscapeCatalog(config: any, catalog: { id: string; type: string }): boolean {
-  return catalogSettingsFor(config, catalog)?.metadata?.posterShape === 'landscape';
+  return isLandscapeCatalogConfig(config, catalogSettingsFor(config, catalog));
 }
 
 export function showLandscape(items: any[]): void {
@@ -1064,6 +1079,7 @@ export function buildEpisode(
       SeasonId: hasSeason ? parentSeasonId : null,
       SeriesId: seriesId,
       SeriesName: meta.name,
+      OriginalLanguage: originalLanguage(meta),
       OfficialRating: meta.app_extras?.certification || null,
       ParentIndexNumber: hasSeason ? video.season : null,
       IndexNumber: Number(video.episode),
@@ -1072,6 +1088,7 @@ export function buildEpisode(
       DateCreated: premiere || EPOCH_DATE,
       RunTimeTicks: parseRuntimeTicks(video.runtime),
       ProviderIds: {},
+      Tags: [(video.isFiller ?? video.filler) === true && 'Filler', video.isMixedFiller === true && 'Mixed Canon/Filler', (video.isRecap ?? video.recap) === true && 'Recap'].filter(Boolean),
       ImageTags: video.thumbnail ? { Primary: imageTag(video.thumbnail) } : {},
       BackdropImageTags: [],
       ImageBlurHashes: {},

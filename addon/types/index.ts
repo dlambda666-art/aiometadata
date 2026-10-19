@@ -6,6 +6,9 @@ export interface UserConfig {
   jellyfinStreamUrl?: string;
   jellyfinLatestRows?: boolean;
   jellyfinMarkUnaired?: boolean;
+  jellyfinUpcomingMode?: 'airing';
+  /** Where a title's similar titles come from. TMDB when unset. */
+  jellyfinSimilarSource?: 'simkl';
   /** Playback is reported by the client, so the subtitle trigger is not used. */
   playbackReporting?: boolean;
   /** Password a Jellyfin client signs in with, for accounts that have no configuration password. */
@@ -15,6 +18,8 @@ export interface UserConfig {
   /** Name and picture of the main Jellyfin user, the configuration itself. */
   jellyfinUserName?: string;
   jellyfinUserAvatar?: string;
+  /** The main user's PIN: 4 to 12 digits as typed, or the hash the server saved it as. */
+  jellyfinUserPin?: string;
   jellyfinUserTags?: string[];
   jellyfinUserHandoffNames?: string[];
   jellyfinSkipSource?: 'auto' | 'off' | 'publicmetadb' | 'aniskip' | 'introdb' | Array<'publicmetadb' | 'aniskip' | 'introdb'>;
@@ -94,10 +99,14 @@ export interface UserConfig {
   exclusionGenres?: string;
   exclusionTmdbKeywords?: string[];
   tvdbSeasonType?: string;
+  animeEpisodeDates?: 'provider' | 'earliest' | 'dub';
   tvdbEpisodeOrders?: Record<string, string>;
+  tvdbNormalizeYearSeasons?: boolean;
+  tvdbShowSeasonNumbering?: Record<string, 'years' | 'sequential'>;
   castCount?: number;
   blurThumbs?: boolean;
   displayAgeRating?: boolean;
+  contentRatingCountry?: string;
   configVersion?: number;
   userUUID?: string;
   sessionId?: string;

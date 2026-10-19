@@ -103,7 +103,7 @@ function pinInvalid(pin?: string): boolean {
   return Boolean(pin && !SAVED_PIN.test(pin) && !PIN_PATTERN.test(pin));
 }
 
-function PinField({ name, pin, onChange }: { name: string; pin?: string; onChange: (pin: string | undefined) => void }) {
+function PinField({ name, pin, main, onChange }: { name: string; pin?: string; main?: boolean; onChange: (pin: string | undefined) => void }) {
   const [editing, setEditing] = useState(false);
   const saved = Boolean(pin && SAVED_PIN.test(pin));
   const invalid = pinInvalid(pin);
@@ -133,7 +133,9 @@ function PinField({ name, pin, onChange }: { name: string; pin?: string; onChang
       <p className={cn('text-[11px]', invalid ? 'text-destructive' : 'text-muted-foreground')}>
         {invalid
           ? 'A PIN is 4 to 12 digits.'
-          : 'Asked whenever someone switches to this user, from your own user too. To sign in as them on a client, enter the password, a slash and the PIN, like password/1234. Setting or changing it signs this user out on every device.'}
+          : main
+            ? 'Asked whenever another user switches to you. To sign in as you on a client, enter the password, a slash and the PIN, like password/1234. Setting or changing it signs you out on every device.'
+            : 'Asked whenever someone switches to this user, from your own user too. To sign in as them on a client, enter the password, a slash and the PIN, like password/1234. Setting or changing it signs this user out on every device.'}
       </p>
     </div>
   );
@@ -280,7 +282,7 @@ function UserRow({ name, avatar, main, user, allTags, catalogCount, trackerOptio
             <Label className="text-xs font-medium">Watchlist</Label>
             <WatchlistPicker value={user?.watchlistServices} options={watchlistOptions} onChange={(next) => onChange({ watchlistServices: next })} inheritLabel={main || holder ? 'Every connected' : 'Same as you'} />
             <p className="text-[11px] text-muted-foreground">
-              A client's favourites are the watchlist: the picked shelves merged, and a heart on a title in a client writes to the shelves that take it. This server only leaves favourites to the hearts set here. MDBList and Trakt file anime under movies and series; Simkl, AniList and MyAnimeList keep an anime shelf.
+              A client's favourites are the watchlist: the picked shelves merged, and a heart on a title in a client writes to the shelves that take it. This server keeps the hearts set here as a list of its own, alone or alongside the picked shelves. MDBList and Trakt file anime under movies and series; Simkl, AniList and MyAnimeList keep an anime shelf.
             </p>
           </div>
         )}
@@ -298,7 +300,7 @@ function UserRow({ name, avatar, main, user, allTags, catalogCount, trackerOptio
             </p>
           </div>
         )}
-        {!main && <PinField name={name} pin={user?.pin} onChange={(pin) => onChange({ pin })} />}
+        <PinField name={name} pin={user?.pin} main={main} onChange={(pin) => onChange({ pin })} />
         <div className="space-y-1.5">
           <Label className="text-xs font-medium">Skip intro and credits</Label>
           <SkipSourcePicker
@@ -321,25 +323,27 @@ type WatchlistOption = { value: string; label: string; shelves: WatchlistShelf[]
 const SHELF_LABELS: Record<WatchlistShelf, string> = { movies: 'Movies', series: 'Series', anime: 'Anime' };
 
 const WATCHLIST_NONE = 'none';
+const WATCHLIST_SERVER = 'server';
 
-/** A pick is `service:shelf`; none picked means every shelf of every connected service. */
+/** A pick is `service:shelf` or `server`; none picked means every shelf of every connected service. */
 function WatchlistPicker({ value, options, onChange, inheritLabel }: { value?: string[]; options: WatchlistOption[]; onChange: (next: string[] | undefined) => void; inheritLabel: string }) {
-  const serverOnly = (value ?? []).includes(WATCHLIST_NONE);
-  const picked = serverOnly ? [] : (value ?? []).flatMap((token) => {
+  const server = (value ?? []).some((token) => token === WATCHLIST_NONE || token === WATCHLIST_SERVER);
+  const picked = (value ?? []).flatMap((token) => {
     const [service, shelf] = token.split(':');
     const option = options.find((o) => o.value === service);
     if (!option) return [];
     return shelf ? [token] : option.shelves.map((s) => `${service}:${s}`);
   });
-  const toggle = (token: string) => {
-    const next = picked.includes(token) ? picked.filter((t) => t !== token) : [...picked, token];
+  const save = (withServer: boolean, shelves: string[]) => {
+    const next = withServer ? [WATCHLIST_SERVER, ...shelves] : shelves;
     onChange(next.length ? next : undefined);
   };
+  const toggle = (token: string) => save(server, picked.includes(token) ? picked.filter((t) => t !== token) : [...picked, token]);
   return (
     <div className="space-y-1">
       <div className="flex flex-wrap items-center gap-1.5">
-        <TagChip name={inheritLabel} onClick={() => onChange(undefined)} pressed={!serverOnly && picked.length === 0} dimmed={serverOnly || picked.length > 0} />
-        <TagChip name="This server only" onClick={() => onChange(serverOnly ? undefined : [WATCHLIST_NONE])} pressed={serverOnly} dimmed={!serverOnly} />
+        <TagChip name={inheritLabel} onClick={() => onChange(undefined)} pressed={!server && picked.length === 0} dimmed={server || picked.length > 0} />
+        <TagChip name="This server" onClick={() => save(!server, picked)} pressed={server} dimmed={!server} />
       </div>
       {options.map((opt) => (
         <div key={opt.value} className="flex flex-wrap items-center gap-1.5">
@@ -356,7 +360,7 @@ function WatchlistPicker({ value, options, onChange, inheritLabel }: { value?: s
 
 function resumeSourceCaption(value: string, options: Array<{ value: string; label: string; animeOnly?: boolean }>): string {
   if (value === 'off') {
-    return 'This server only: Continue Watching, Next Up and the watched ticks come from what you play through this server, on this configuration. Nothing watched elsewhere appears, and nothing is read from your trackers; plays are still reported to them. Favourites follow the watchlist picks below, which have their own "This server only".';
+    return 'This server only: Continue Watching, Next Up and the watched ticks come from what you play through this server, on this configuration. Nothing watched elsewhere appears, and nothing is read from your trackers; plays are still reported to them. Favourites follow the watchlist picks below, which have their own "This server".';
   }
   if (value === 'auto') {
     const names = options.filter((o) => !o.animeOnly).map((o) => o.label);
@@ -467,6 +471,7 @@ export function JellyfinDialog({ open, onOpenChange, userUUID }: JellyfinDialogP
   const { config, setConfig, auth } = useConfig();
   const { requestSave, isSaving, isDirty, canSave } = useSave();
   const [resolveMode, setResolveMode] = useState<string>('user');
+  const [upcomingMode, setUpcomingMode] = useState<string>('user');
   const [baseUrl, setBaseUrl] = useState<string>(window.location.origin);
   const serverAddress = `${baseUrl.replace(/\/+$/, '')}/jellyfin/${userUUID}`;
   useEffect(() => {
@@ -476,12 +481,14 @@ export function JellyfinDialog({ open, onOpenChange, userUUID }: JellyfinDialogP
       .then((data) => {
         if (cancelled || !data) return;
         if (data.jellyfinResolveOnOpen) setResolveMode(String(data.jellyfinResolveOnOpen));
+        if (data.jellyfinUpcomingMode) setUpcomingMode(String(data.jellyfinUpcomingMode));
         if (typeof data.jellyfinBaseUrl === 'string' && data.jellyfinBaseUrl.trim()) setBaseUrl(data.jellyfinBaseUrl.trim());
       })
       .catch(() => undefined);
     return () => { cancelled = true; };
   }, []);
   const resolveForced: boolean | null = resolveMode === 'always' ? true : resolveMode === 'never' ? false : null;
+  const upcomingForced = upcomingMode === 'caught-up' || upcomingMode === 'airing' ? upcomingMode : null;
   const mainName = config.jellyfinUserName || config.addonName || userUUID.slice(0, 8);
   const tags = useMemo(() => config.tags ?? [], [config.tags]);
   const users = useMemo(() => config.jellyfinUsers ?? [], [config.jellyfinUsers]);
@@ -529,7 +536,7 @@ export function JellyfinDialog({ open, onOpenChange, userUUID }: JellyfinDialogP
   const addCatalogs = (entries: CatalogConfig[]) =>
     setConfig(prev => ({ ...prev, catalogs: [...prev.catalogs, ...entries.filter((e) => !prev.catalogs.some((c) => c.id === e.id && c.type === e.type))] }));
   const nameClash = handoffNameClash(mainName, config.jellyfinUserHandoffNames, users);
-  const badPin = users.some((user) => pinInvalid(user.pin));
+  const badPin = pinInvalid(config.jellyfinUserPin) || users.some((user) => pinInvalid(user.pin));
   const addUser = () => {
     const clean = newUserName.trim();
     if (!clean) return;
@@ -683,84 +690,86 @@ export function JellyfinDialog({ open, onOpenChange, userUUID }: JellyfinDialogP
           </div>
 
           <div className="grid gap-6 border-t pt-4 md:grid-cols-3">
-            <div className="space-y-1.5">
-              <Label htmlFor="jellyfin-quick-connect" className="text-sm font-medium">Quick Connect</Label>
-              <div className="flex flex-col gap-2">
-                {users.length > 0 ? (
-                  <Select value={quickConnectProfile || '__main__'} onValueChange={(v) => setQuickConnectProfile(v === '__main__' ? '' : v)}>
-                    <SelectTrigger className="w-full" aria-label="Sign the device in as">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="__main__">{mainName}</SelectItem>
-                      {users.map((u) => (
-                        <SelectItem key={u.id} value={u.id}>{u.name || 'Unnamed user'}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                ) : null}
-                <div className="flex flex-1 items-center gap-2">
-                <Input
-                  id="jellyfin-quick-connect"
-                  value={quickConnectCode}
-                  inputMode="numeric"
-                  maxLength={7}
-                  placeholder="000000"
-                  className="font-mono text-sm tracking-widest"
-                  onChange={(e) => setQuickConnectCode(e.target.value.replace(/[^\d ]/g, ''))}
-                  onKeyDown={(e) => { if (e.key === 'Enter') approveQuickConnect(); }}
-                  aria-label="Quick Connect code"
-                />
-                <Button size="sm" variant="outline" disabled={approving} onClick={approveQuickConnect}>
-                  {approving ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : null}
-                  Approve
-                </Button>
-                </div>
-              </div>
-              <p className="text-xs text-muted-foreground">
-                Pick Quick Connect on the client's sign-in screen and enter the code it shows here. The client signs in without a password{users.length > 0 ? ', as the user chosen here' : ''}.
-              </p>
-            </div>
-
-            <div className="space-y-1.5">
-              <Label htmlFor="jellyfin-client-password" className="text-sm font-medium">Client password</Label>
-              {config.jellyfinAppPassword ? (
-                <div className="flex items-center gap-2">
+            <div className="space-y-6">
+              <div className="space-y-1.5">
+                <Label htmlFor="jellyfin-quick-connect" className="text-sm font-medium">Quick Connect</Label>
+                <div className="flex flex-col gap-2">
+                  {users.length > 0 ? (
+                    <Select value={quickConnectProfile || '__main__'} onValueChange={(v) => setQuickConnectProfile(v === '__main__' ? '' : v)}>
+                      <SelectTrigger className="w-full" aria-label="Sign the device in as">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__main__">{mainName}</SelectItem>
+                        {users.map((u) => (
+                          <SelectItem key={u.id} value={u.id}>{u.name || 'Unnamed user'}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  ) : null}
+                  <div className="flex flex-1 items-center gap-2">
                   <Input
-                    id="jellyfin-client-password"
-                    value={config.jellyfinAppPassword}
-                    readOnly
-                    className="font-mono text-sm"
-                    aria-label="Jellyfin client password"
+                    id="jellyfin-quick-connect"
+                    value={quickConnectCode}
+                    inputMode="numeric"
+                    maxLength={7}
+                    placeholder="000000"
+                    className="font-mono text-sm tracking-widest"
+                    onChange={(e) => setQuickConnectCode(e.target.value.replace(/[^\d ]/g, ''))}
+                    onKeyDown={(e) => { if (e.key === 'Enter') approveQuickConnect(); }}
+                    aria-label="Quick Connect code"
                   />
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => copyToClipboard(config.jellyfinAppPassword ?? '', 'Client password')}
-                  >
-                    <Copy className="h-4 w-4" />
+                  <Button size="sm" variant="outline" disabled={approving} onClick={approveQuickConnect}>
+                    {approving ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+                    Approve
                   </Button>
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Pick Quick Connect on the client's sign-in screen and enter the code it shows here. The client signs in without a password{users.length > 0 ? ', as the user chosen here' : ''}.
+                </p>
+              </div>
+  
+              <div className="space-y-1.5">
+                <Label htmlFor="jellyfin-client-password" className="text-sm font-medium">Client password</Label>
+                {config.jellyfinAppPassword ? (
+                  <div className="flex items-center gap-2">
+                    <Input
+                      id="jellyfin-client-password"
+                      value={config.jellyfinAppPassword}
+                      readOnly
+                      className="font-mono text-sm"
+                      aria-label="Jellyfin client password"
+                    />
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => copyToClipboard(config.jellyfinAppPassword ?? '', 'Client password')}
+                    >
+                      <Copy className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setConfig(prev => ({ ...prev, jellyfinAppPassword: newClientPassword() }))}
+                    >
+                      Replace
+                    </Button>
+                  </div>
+                ) : (
                   <Button
                     variant="outline"
                     size="sm"
+                    className="w-full sm:w-auto"
                     onClick={() => setConfig(prev => ({ ...prev, jellyfinAppPassword: newClientPassword() }))}
                   >
-                    Replace
+                    Generate
                   </Button>
-                </div>
-              ) : (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="w-full sm:w-auto"
-                  onClick={() => setConfig(prev => ({ ...prev, jellyfinAppPassword: newClientPassword() }))}
-                >
-                  Generate
-                </Button>
-              )}
-              <p className="text-xs text-muted-foreground">
-                For clients without Quick Connect. Sign in with this instead of the configuration password, which an account created through a sign-in provider never set. It works only on this address, and replacing it signs the clients out.
-              </p>
+                )}
+                <p className="text-xs text-muted-foreground">
+                  For clients without Quick Connect. Sign in with this instead of the configuration password, which an account created through a sign-in provider never set. It works only on this address, and replacing it signs the clients out.
+                </p>
+              </div>
             </div>
 
             <div className="space-y-1.5">
@@ -801,6 +810,10 @@ export function JellyfinDialog({ open, onOpenChange, userUUID }: JellyfinDialogP
                   aria-label="Wait for the streams when a title opens"
                 />
               </div>
+            </div>
+
+            <div className="space-y-3">
+              <Label className="text-sm font-medium">Browsing</Label>
               <div className="flex items-start justify-between gap-3">
                 <div className="space-y-0.5">
                   <Label className="text-xs font-medium">Show a Latest row per catalog</Label>
@@ -827,6 +840,45 @@ export function JellyfinDialog({ open, onOpenChange, userUUID }: JellyfinDialogP
                   aria-label="Mark unaired episodes"
                 />
               </div>
+              <div className="flex items-start justify-between gap-3">
+                <div className="space-y-0.5">
+                  <Label className="text-xs font-medium">Upcoming row</Label>
+                  <p className="text-[11px] text-muted-foreground">
+                    {upcomingForced
+                      ? 'Set by this server.'
+                      : 'Caught up lists the next episode of the shows you have watched every aired episode of, so a show is in Upcoming or Next Up, never both. Everything airing lists the next episode of every show you follow, behind or not, so a show you are behind on can be in both. Watchlisted films that are not out yet are in it either way.'}
+                  </p>
+                </div>
+                <Select
+                  value={upcomingForced ?? config.jellyfinUpcomingMode ?? 'caught-up'}
+                  disabled={upcomingForced !== null}
+                  onValueChange={(v) => setConfig(prev => ({ ...prev, jellyfinUpcomingMode: v === 'airing' ? 'airing' : undefined }))}
+                >
+                  <SelectTrigger className="h-8 w-40 shrink-0 text-xs" aria-label="Upcoming row"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="caught-up">Caught up</SelectItem>
+                    <SelectItem value="airing">Everything airing</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <div className="space-y-0.5">
+                  <Label className="text-xs font-medium">Similar titles</Label>
+                  <p className="text-[11px] text-muted-foreground">
+                    The titles an app shows as similar on a title's page. TMDB suggests from its own recommendations. Simkl suggests what its users recommend alongside the title, or titles in the same genres when there are none, and uses TMDB for a title it does not know. Also what the More Like This catalog returns to apps that ask for one.
+                  </p>
+                </div>
+                <Select
+                  value={config.jellyfinSimilarSource ?? 'tmdb'}
+                  onValueChange={(v) => setConfig(prev => ({ ...prev, jellyfinSimilarSource: v === 'simkl' ? 'simkl' : undefined }))}
+                >
+                  <SelectTrigger className="h-8 w-40 shrink-0 text-xs" aria-label="Similar titles"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="tmdb">TMDB</SelectItem>
+                    <SelectItem value="simkl">Simkl</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
             </div>
           </div>
           <div className="space-y-2 border-t pt-4">
@@ -846,6 +898,7 @@ export function JellyfinDialog({ open, onOpenChange, userUUID }: JellyfinDialogP
                 skipSource: config.jellyfinSkipSource ?? 'auto',
                 watchlistServices: config.jellyfinWatchlistServices,
                 handoffNames: config.jellyfinUserHandoffNames,
+                pin: config.jellyfinUserPin,
               }}
               allTags={tags}
               catalogCount={catalogCountFor(config.jellyfinUserTags ?? [])}
@@ -864,6 +917,7 @@ export function JellyfinDialog({ open, onOpenChange, userUUID }: JellyfinDialogP
                 ...('skipSource' in patch ? { jellyfinSkipSource: patch.skipSource === 'auto' ? undefined : patch.skipSource } : {}),
                 ...('watchlistServices' in patch ? { jellyfinWatchlistServices: patch.watchlistServices } : {}),
                 ...('handoffNames' in patch ? { jellyfinUserHandoffNames: patch.handoffNames } : {}),
+                ...('pin' in patch ? { jellyfinUserPin: patch.pin } : {}),
               }))}
             />
             {users.map((user) => {
