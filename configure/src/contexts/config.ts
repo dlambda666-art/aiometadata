@@ -13,6 +13,11 @@ export interface TagDef {
   ageRating?: string;
   /** Only meaningful alongside ageRating. Absent means unrated titles show. */
   allowUnratedContent?: boolean;
+  viewingHours?: { start: string; end: string };
+  allowDownloads?: boolean;
+  hideKeywords?: string[];
+  hideWords?: string[];
+  hideGenres?: string[];
 }
 
 export type CardService = 'simkl' | 'mdblist' | 'publicmetadb' | 'anilist' | 'mal';
@@ -171,6 +176,7 @@ export interface CatalogConfig {
     pickMinVotes?: number;
     /** Only offered to a Jellyfin card that holds the account backing this catalog. */
     accountsOnly?: boolean;
+    accountOwner?: string;
   };
 }
 
@@ -344,7 +350,8 @@ export interface AppConfig {
     gemini_model?: string;
     openrouter_model?: string;
     /** Which watch histories the profile is built from. */
-    sources?: 'simkl' | 'mdblist' | 'both';
+    sources?: 'simkl' | 'mdblist' | 'both' | 'local';
+    profiles?: Record<string, { sources?: 'same' | 'simkl' | 'mdblist' | 'both' | 'local' }>;
     /** Gemini google_search grounding, or the OpenRouter :online suffix. Off unless set. */
     web_search?: boolean;
     /**
@@ -352,7 +359,7 @@ export interface AppConfig {
      * counted against the same reply budget as the answer, so a high setting
      * can leave a long list with no room to finish. OpenRouter only.
      */
-    reasoning_effort?: 'minimal' | 'low' | 'medium' | 'high';
+    reasoning_effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high';
     /**
      * How much a series left unfinished counts against it. Stalling is weak
      * evidence: people stop because a season ended or they forgot, not only

@@ -18,6 +18,7 @@ const anilist = require("./lib/anilist");
 const { getSearch } = require("./lib/getSearch");
 const { getManifest, resolveManifestTags, DEFAULT_LANGUAGE } = require("./lib/getManifest");
 const { resolveInstallFilters, uniformTagRating, allowsUnrated, scopeTagsToCatalog } = require("./utils/ageRating");
+const { withTagExclusions } = require("./utils/tagExclusions");
 const { getMeta } = require("./lib/getMeta");
 const { cacheWrapMetaSmart, cacheWrapCatalog, cacheWrapSearch, cacheWrapJikanApi, cacheWrapGlobal, classifyResultAllowEmpty, getCacheHealth, clearCacheHealth, logCacheHealth, stableStringify, deleteKeysByPattern, scanKeys } = require("./lib/getCache");
 const { hasPermission } = require("./lib/authSession");
@@ -37,7 +38,7 @@ const { supportsMdblistScoreFilters } = require("./utils/mdbList");
 
 const configApi = require('./lib/configApi');
 const database = require('./lib/database');
-const { loadConfigFromDatabase } = require('./lib/configApi');
+const { loadConfigFromDatabase, loadRouteConfig } = require('./lib/configApi');
 const { getTrending } = require("./lib/getTrending");
 const { resolveProxyRatingPosterUrl, parseAnimeCatalogMetaBatch } = require("./utils/parseProps");
 const { extractIdsFromMeta, extractCanonicalIdFromDynamicUpNextId } = require("./utils/metaIds");
@@ -428,6 +429,9 @@ function applyImageCachePrefix(data) {
   };
 
   applyToMeta(data.meta);
+  if (Array.isArray(data.meta?.credits)) {
+    for (const credit of data.meta.credits) applyToMeta(credit);
+  }
   if (Array.isArray(data.metas)) {
     for (const meta of data.metas) applyToMeta(meta);
   }
@@ -529,9 +533,10 @@ function applyRatingOverrides(config, req, userUUID) {
 
   const hidesUnrated = allowUnrated === false && allowsUnrated(config);
   const showsUnrated = allowUnrated === true && !allowsUnrated(config);
-  if (!ageRating && !hidesUnrated && !showsUnrated) return config;
+  const excluded = withTagExclusions(config, tags);
+  if (!ageRating && !hidesUnrated && !showsUnrated) return excluded;
 
-  const next = { ...config };
+  const next = { ...excluded };
   if (ageRating) {
     next.ageRating = ageRating;
     next._ratingOverride = ageRating;
@@ -2624,7 +2629,8 @@ addon.get("/api/tmdb/collections/resolve", async (req, res) => {
 });
 
 // AI-powered catalog creation
-const aiCatalogRateLimit = new Map();
+const { LRUCache: AiRateCache } = require('lru-cache');
+const aiCatalogRateLimit = new AiRateCache({ max: 10000, ttl: 60000 });
 addon.post("/api/ai/create-catalog", async (req, res) => {
   try {
     const { userUUID, password, query, provider, generationMode, model: requestedModel, geminiKey: clientGeminiKey, openrouterKey: clientOpenrouterKey } = req.body;
@@ -3233,6 +3239,9 @@ addon.get("/api/recommendations/status", async (req: any, res: any) => {
   try {
     const userUUID = String(req.query.userUUID || '').trim();
     if (!userUUID) return res.status(400).json({ error: "userUUID is required" });
+    if (!(await resolveConfigAccess(req, userUUID, req.get('x-config-password')))) {
+      return res.status(401).json({ error: "Invalid UUID or password" });
+    }
 
     const storedConfig = await loadConfigFromDatabase(userUUID);
     if (!storedConfig) return res.status(404).json({ error: "User configuration not found" });
@@ -3250,30 +3259,35 @@ addon.get("/api/recommendations/status", async (req: any, res: any) => {
       } catch { /* a malformed override falls back to what is saved */ }
     }
 
-    const { collectWatchedRows, isWatched, resolveSources }: any = require('./utils/recommendations/history');
+    const { collectWatchedRows, isWatched, resolveSources, trackerAvailability, runAsProfile }: any = require('./utils/recommendations/history');
     const { summarise }: any = require('./utils/recommendations/rows');
     const { resolveProvider }: any = require('./utils/recommendations/provider');
-
-    const sources = resolveSources(config);
-    const rows = (await collectWatchedRows(config, userUUID)).filter(isWatched);
-    const chosen = resolveProvider(config);
-
     const { profileCacheKey }: any = require('./utils/recommendations/profile');
-    const redis = require('./lib/redisClient').default || require('./lib/redisClient');
-    const profileKey = `global:e2:${profileCacheKey(config, userUUID)}`;
-    let profile: any = null;
-    try {
-      const raw = await redis.get(profileKey);
-      if (raw) profile = JSON.parse(raw);
-    } catch { /* a missing profile is the normal state before the first build */ }
+    const { readGlobalCache }: any = require('./lib/getCache');
 
-    return res.json({
-      sources: sources.choice,
-      connected: { simkl: sources.simkl, mdblist: sources.mdblist },
-      provider: chosen ? { provider: chosen.provider, model: chosen.model } : null,
-      counts: summarise(rows, require('./utils/recommendations/rows').tuningFrom(config)),
-      profile: profile ? { summary: profile.summary, builtAt: profile.builtAt, builtFrom: profile.builtFrom } : null,
+    const { listProfiles }: any = require('./lib/jellyfin/profiles');
+    const profiles = listProfiles(config, userUUID)
+      .filter((entry: any) => entry.id && !entry.sharesHistory)
+      .map((entry: any) => {
+        const keys = (config.jellyfinUsers || []).find((user: any) => user?.id === entry.id)?.accounts?.apiKeys || {};
+        return { id: entry.id, name: entry.name, avatar: entry.avatar, linked: [keys.simklTokenId && 'Simkl', keys.mdblist && 'MDBList'].filter(Boolean) };
+      });
+
+    const report = await runAsProfile(config, userUUID, String(req.query.profile || ''), async (viewerConfig: any) => {
+      const sources = resolveSources(viewerConfig);
+      const rows = (await collectWatchedRows(viewerConfig, userUUID)).filter(isWatched);
+      const chosen = resolveProvider(viewerConfig);
+      const profile: any = await readGlobalCache(profileCacheKey(viewerConfig, userUUID));
+      return {
+        sources: sources.choice,
+        connected: { simkl: sources.simkl, mdblist: sources.mdblist, local: sources.local },
+        available: trackerAvailability(viewerConfig),
+        provider: chosen ? { provider: chosen.provider, model: chosen.model } : null,
+        counts: summarise(rows, require('./utils/recommendations/rows').tuningFrom(viewerConfig)),
+        profile: profile ? { summary: profile.summary, builtAt: profile.builtAt, builtFrom: profile.builtFrom } : null,
+      };
     });
+    return res.json({ ...report, profiles });
   } catch (error: any) {
     consola.withTag('Recommendations').warn(`Status failed: ${error.message}`);
     return res.status(500).json({ error: "Could not read recommendation status" });
@@ -3289,6 +3303,9 @@ addon.post("/api/recommendations/generate", async (req: any, res: any) => {
     if (!userUUID || !catalogId) {
       return res.status(400).json({ error: "userUUID and catalogId are required" });
     }
+    if (!(await resolveConfigAccess(req, userUUID, req.body?.password))) {
+      return res.status(401).json({ error: "Invalid UUID or password" });
+    }
 
     const storedConfig = await loadConfigFromDatabase(userUUID);
     if (!storedConfig) return res.status(404).json({ error: "User configuration not found" });
@@ -3301,7 +3318,8 @@ addon.post("/api/recommendations/generate", async (req: any, res: any) => {
     }
 
     const { startJob }: any = require('./utils/recommendations/jobs');
-    const job = startJob(config, userUUID, catalogId);
+    const { runAsProfile }: any = require('./utils/recommendations/history');
+    const job = runAsProfile(config, userUUID, String(req.body?.profile || ''), (viewerConfig: any) => startJob(viewerConfig, userUUID, catalogId, req.body?.force === true));
     return res.json({ job });
   } catch (error: any) {
     return res.status(400).json({ error: error.message });
@@ -3313,7 +3331,8 @@ addon.get("/api/recommendations/jobs", (req: any, res: any) => {
   if (!userUUID) return res.status(400).json({ error: "userUUID is required" });
   const { listJobs, pruneJobs }: any = require('./utils/recommendations/jobs');
   pruneJobs();
-  return res.json({ jobs: listJobs(userUUID) });
+  const profile = String(req.query.profile || '').trim();
+  return res.json({ jobs: listJobs(profile ? `${userUUID}#${profile}` : userUUID) });
 });
 
 // --- Trakt Proxy Endpoints ---
@@ -4757,6 +4776,7 @@ addon.delete("/api/cache/clear/:key", requireDashboardAdmin, async (req, res) =>
     } else {
       // Clear specific key
       const result = await redis.del(key);
+      require('./lib/metaMemory').forgetAllHeld();
       consola.info(`[Cache] Cleared cache key: ${key} (result: ${result})`);
       res.json({
         success: true,
@@ -4911,7 +4931,7 @@ addon.get("/stremio/:userUUID/manifest.json", async function (req, res) {
 // --- Catalog Route under /stremio/:userUUID prefix ---
 const catalogRoute = async function (req, res) {
   const { userUUID, type, id, extra } = req.params;
-  const storedConfig = await loadConfigFromDatabase(userUUID);
+  const storedConfig = await loadRouteConfig(userUUID);
   
   if (!storedConfig) {
     return res.status(404).send({ error: "User configuration not found" });
@@ -5705,7 +5725,7 @@ const metaRoute = async function (req, res) {
   }
   
   // Load config from database
-  const config = await loadConfigFromDatabase(userUUID);
+  const config = await loadRouteConfig(userUUID);
   if (!config) {
     return res.status(404).send({ error: "User configuration not found" });
   }
@@ -6075,8 +6095,8 @@ addon.post("/stremio/:userUUID/rating", async function (req, res) {
       mdblist: { success: false, error: null }
     };
 
-    const isImdbIdAnime = stremioId.startsWith('tt') && !!idMapper.getTraktAnimeMovieByImdbId(stremioId) && type.toLowerCase() === 'movie';
-    const isTmdbIdAnime = stremioId.startsWith('tmdb:') && !!idMapper.getTraktAnimeMovieByTmdbId(stremioId.replace('tmdb:', '')) && type.toLowerCase() === 'movie';
+    const isImdbIdAnime = stremioId.startsWith('tt') && type.toLowerCase() === 'movie' && !!idMapper.filmMappingFor({ imdbId: stremioId });
+    const isTmdbIdAnime = stremioId.startsWith('tmdb:') && type.toLowerCase() === 'movie' && !!idMapper.filmMappingFor({ tmdbId: stremioId.replace('tmdb:', '') });
     // Check if the Stremio ID is from an anime provider (anilist, mal, kitsu, anidb)
     const isAnimeId = stremioId && typeof stremioId === 'string' && (
       stremioId.startsWith('anilist:') || 
@@ -6091,8 +6111,9 @@ addon.post("/stremio/:userUUID/rating", async function (req, res) {
     const allIds = await resolveAllIds(stremioId, finalType, config);
     if (type.toLowerCase() === 'movie') {
       if (allIds?.malId) {
-        allIds.imdbId = idMapper.getTraktAnimeMovieByMalId(allIds.malId)?.externals.imdb;
-        allIds.tmdbId = idMapper.getTraktAnimeMovieByMalId(allIds.malId)?.externals.tmdb || allIds.tmdbId;
+        const film = idMapper.filmIdsFor(idMapper.getMappingByMalId(allIds.malId) ?? { type: 'MOVIE', mal_id: allIds.malId });
+        allIds.imdbId = film.imdbId;
+        allIds.tmdbId = film.tmdbId || allIds.tmdbId;
         allIds.tvdbId = (idMappings.getByImdbId(allIds.imdbId, 'movie'))?.tvdbId || null;
       }
     }
@@ -6167,12 +6188,12 @@ addon.post("/stremio/:userUUID/rating", async function (req, res) {
           }
 
           if (isImdbIdAnime) {
-            const malId =  idMapper.getTraktAnimeMovieByImdbId(stremioId)?.myanimelist.id;
+            const malId = idMapper.filmMappingFor({ imdbId: stremioId })?.mal_id;
             if (malId) {
               anilistId = idMapper.getMappingByMalId(malId)?.anilist_id;
             }
           } else if (isTmdbIdAnime) {
-            const malId = idMapper.getTraktAnimeMovieByTmdbId(stremioId.replace('tmdb:', ''))?.myanimelist.id;
+            const malId = idMapper.filmMappingFor({ tmdbId: stremioId.replace('tmdb:', '') })?.mal_id;
             if (malId) {
               anilistId = idMapper.getMappingByMalId(malId)?.anilist_id;
             }
@@ -6455,8 +6476,8 @@ const handlePosterProxy = async function (req, res) {
       imageClass: 'poster',
       url: posterUrl,
       bypassed,
-      open: async (validators) => {
-        const imageResponse = await openUpstream(validators);
+      open: async (validators, signal) => {
+        const imageResponse = await openUpstream(validators, signal);
         if (bypassed && posterCacheConfig.isBuiltinPosterCacheEnabled()) {
           require('./lib/posterCache/handler.js').recordServe('poster', 'BYPASS', 0, req.method, posterUrl);
         }
@@ -6511,8 +6532,8 @@ function streamArtWithFallback(assetName) {
         imageClass: assetName,
         url: customUrl,
         bypassed,
-        open: async (validators) => {
-          const imageResponse = await openUpstream(validators);
+        open: async (validators, signal) => {
+          const imageResponse = await openUpstream(validators, signal);
           if (bypassed && posterCacheConfig.isBuiltinPosterCacheEnabled()) {
             require('./lib/posterCache/handler.js').recordServe(assetName, 'BYPASS', 0, req.method, customUrl);
           }
@@ -6677,8 +6698,8 @@ addon.get("/stremio/:userUUID/rating", async function (req, res) {
       mdblist: false
     };
     consola.debug(`[Rating Page] Checking if ID is anime - id: ${id}, metaType: ${metaType}, gettraktanimemoviebyimdbid: ${JSON.stringify(idMapper.getTraktAnimeMovieByImdbId(id))}`);  
-    const isImdbIdAnime = id && id.startsWith('tt') && !!idMapper.getTraktAnimeMovieByImdbId(id) && metaType === 'Movie';
-    const isTmdbIdAnime = id && id.startsWith('tmdb:') && !!idMapper.getTraktAnimeMovieByTmdbId(id.replace('tmdb:', '')) && metaType === 'Movie';
+    const isImdbIdAnime = id && id.startsWith('tt') && metaType === 'Movie' && !!idMapper.filmMappingFor({ imdbId: id });
+    const isTmdbIdAnime = id && id.startsWith('tmdb:') && metaType === 'Movie' && !!idMapper.filmMappingFor({ tmdbId: id.replace('tmdb:', '') });
     // Check if the Stremio ID in URL is from an anime provider (anilist, mal, kitsu, anidb)
     const isAnimeId = id && typeof id === 'string' && (
       id.startsWith('anilist:') || 

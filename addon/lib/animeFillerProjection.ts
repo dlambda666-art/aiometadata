@@ -1,4 +1,4 @@
-import { resolveAnimeEpisode } from './animeEpisodeIds';
+import { mayBeAnime, resolveAnimeEpisode } from './animeEpisodeIds';
 import { covers, episodeKind, isRecap } from './fillerData';
 import type { EpisodeKind } from './fillerData';
 
@@ -10,10 +10,10 @@ export async function applyAnimeFillerProjection(meta: any, config: any): Promis
   const skipMixed = skipFiller && !!options.skipMixedFiller;
   const skipRecap = !!options.skipRecap;
   const mark = !!options.allowEpisodeMarking;
-  if (!(skipFiller || skipRecap || mark) || !Array.isArray(meta?.videos) || !meta.videos.length) return;
-  if (!['tvdb', 'kitsu', 'mal'].includes(meta._metaProvider)) return;
+  if (!Array.isArray(meta?.videos) || !meta.videos.length) return;
 
   try {
+    if (!mayBeAnime(meta)) return;
     const verdicts = new Map<any, { kind: EpisodeKind | null; recap: boolean }>();
     for (const video of meta.videos) {
       const found = await resolveAnimeEpisode(meta, video, config).catch(() => null);
@@ -41,8 +41,10 @@ export async function applyAnimeFillerProjection(meta: any, config: any): Promis
       if ((skipFiller && kind === 'filler') || (skipMixed && kind === 'mixed') || (skipRecap && recap)) continue;
       const updated = { ...video, isFiller: kind === 'filler', isMixedFiller: kind === 'mixed', isRecap: recap };
       const tag = recap ? MARKS.recap : kind ? MARKS[kind] : undefined;
-      if (mark && tag && typeof video.title === 'string' && !video.title.startsWith(tag)) {
-        updated.title = `${tag} ${video.title}`;
+      if (mark && tag) {
+        for (const field of ['title', 'name']) {
+          if (typeof video[field] === 'string' && !video[field].startsWith(tag)) updated[field] = `${tag} ${video[field]}`;
+        }
       }
       videos.push(updated);
     }
