@@ -1,4 +1,6 @@
 import consola from 'consola';
+import { createHash } from 'crypto';
+import { countryName } from '../metaDetails';
 import { imageTag, wideTag } from './imageTags';
 import { LRUCache } from 'lru-cache';
 import { envInt } from '../../utils/envNumber';
@@ -29,17 +31,56 @@ const imageCache = new LRUCache<string, ItemImages>({
 });
 
 /**
- * Scoped per server id, which is derived from the configuration: art depends on
- * a user's providers and language, so two configurations must not read each
+ * Scoped by the configuration's settings: art depends on a user's providers,
+ * language and keys, so two configurations that differ must not read each
  * other's. Held in Redis as well as in process, because a client keeps its item
  * ids across a restart and asks for their art before anything has rebuilt them.
  */
 function imageKey(scope: string, itemId: string): string {
-  return `${scope}|${normaliseJellyfinId(itemId)}`;
+  return `${artScope(scope)}|${normaliseJellyfinId(itemId)}`;
 }
 
-const imageHash = (scope: string): string => `jf:img:${scope}`;
-const artHash = (scope: string): string => `jf:img:tag:${scope}`;
+const ART_SCOPE_SKIPPED = new Set([
+  'userUUID',
+  'addonIdentifier',
+  'sessionId',
+  'configHash',
+  'lastModified',
+  'configVersion',
+  'catalogSetupComplete',
+  'jellyfinUsers',
+  'jellyfinUserName',
+  'jellyfinUserAvatar',
+  'jellyfinUserPin',
+  'jellyfinAppPassword',
+  'playbackReporting',
+]);
+const ART_SCOPE_SKIPPED_KEYS = new Set(['malTokenId', 'anilistTokenId', 'simklTokenId', 'traktTokenId', 'movieLensCredId', 'trakt', 'simkl']);
+const artSignatures = new WeakMap<object, string>();
+const artScopes = new LRUCache<string, string>({ max: envInt('JELLYFIN_IMAGE_CACHE_MAX', 20000, 1) });
+
+function artSignature(config: any): string {
+  const held = artSignatures.get(config);
+  if (held) return held;
+  const view: Record<string, any> = {};
+  for (const [field, value] of Object.entries(config)) {
+    if (ART_SCOPE_SKIPPED.has(field) || field.startsWith('_') || field.endsWith('WatchTracking')) continue;
+    view[field] = field === 'apiKeys' && value && typeof value === 'object'
+      ? Object.fromEntries(Object.entries(value).filter(([name]) => !ART_SCOPE_SKIPPED_KEYS.has(name)))
+      : value;
+  }
+  const signature = `art-${createHash('sha256').update(JSON.stringify(view)).digest('hex').slice(0, 32)}`;
+  artSignatures.set(config, signature);
+  return signature;
+}
+
+export function noteArtScope(serverId: string, config: any): void {
+  if (serverId && config && typeof config === 'object') artScopes.set(serverId, artSignature(config));
+}
+
+const artScope = (serverId: string): string => artScopes.get(serverId) ?? serverId;
+const imageHash = (scope: string): string => `jf:img:${artScope(scope)}`;
+const artHash = (tag: string): string => `jf:img:tag:all:${tag.slice(0, 2)}`;
 
 const artByTag = new LRUCache<string, string>({
   max: envInt('JELLYFIN_IMAGE_CACHE_MAX', 20000, 1) * 2,
@@ -76,24 +117,19 @@ export async function flushRememberedImages(): Promise<void> {
   pendingImages.clear();
 
   const ttl = imageTtl();
-  await Promise.all(
-    batches.map(async ([hash, fields]) => {
-      const flat: string[] = [];
-      for (const [field, value] of fields) flat.push(field, value);
-      try {
-        // One hash per scope rather than a key per item: a key each grew to six
-        // figures on a busy instance and slowed every scan of the keyspace.
-        await redis
-          .multi()
-          .hsetex(hash, 'EX', ttl, 'FIELDS', fields.size, ...flat)
-          .expire(hash, ttl, 'NX')
-          .expire(hash, ttl, 'GT')
-          .exec();
-      } catch {
-        // Art is a cache; a lost write is read from the meta again.
-      }
-    })
-  );
+  // One hash per scope rather than a key per item: a key each grew to six
+  // figures on a busy instance and slowed every scan of the keyspace.
+  const tx = redis.multi();
+  for (const [hash, fields] of batches) {
+    const flat: string[] = [];
+    for (const [field, value] of fields) flat.push(field, value);
+    tx.hsetex(hash, 'EX', ttl, 'FIELDS', fields.size, ...flat).expire(hash, ttl, 'NX').expire(hash, ttl, 'GT');
+  }
+  try {
+    await tx.exec();
+  } catch {
+    // Art is a cache; a lost write is read from the meta again.
+  }
 }
 
 function queueImageWrite(hash: string, field: string, value: string): void {
@@ -106,40 +142,39 @@ function queueImageWrite(hash: string, field: string, value: string): void {
   scheduleImageFlush();
 }
 
-export function rememberArt(scope: string, url: string | undefined): void {
+export function rememberArt(url: string | undefined): void {
   if (!url) return;
   const tag = imageTag(url);
-  const key = `${scope}|${tag}`;
-  if (artByTag.get(key) === url) return;
-  artByTag.set(key, url);
-  if (redis) queueImageWrite(artHash(scope), tag, url);
+  if (artByTag.get(tag) === url) return;
+  artByTag.set(tag, url);
+  if (redis) queueImageWrite(artHash(tag), tag, url);
 }
 
 export function rememberImages(scope: string, itemId: string, images: ItemImages): void {
   if (!images.primary && !images.backdrop && !images.logo && !images.thumb) return;
 
-  rememberArt(scope, images.primary);
-  rememberArt(scope, images.backdrop);
-  rememberArt(scope, images.logo);
-  rememberArt(scope, images.thumb);
-
   const key = imageKey(scope, itemId);
   const held = imageCache.get(key);
   if (held && held.primary === images.primary && held.backdrop === images.backdrop && held.logo === images.logo && held.thumb === images.thumb) return;
+
+  rememberArt(images.primary);
+  rememberArt(images.backdrop);
+  rememberArt(images.logo);
+  rememberArt(images.thumb);
+
   imageCache.set(key, images);
 
   if (redis) queueImageWrite(imageHash(scope), imageField(itemId), JSON.stringify(images));
 }
 
-export async function recallArt(scope: string, tag: string): Promise<string | undefined> {
-  const key = `${scope}|${tag}`;
-  const local = artByTag.get(key);
+export async function recallArt(tag: string): Promise<string | undefined> {
+  const local = artByTag.get(tag);
   if (local) return local;
   if (!redis) return undefined;
   try {
-    const stored = await redis.hget(artHash(scope), tag);
+    const stored = await redis.hget(artHash(tag), tag);
     if (!stored) return undefined;
-    artByTag.set(key, stored);
+    artByTag.set(tag, stored);
     return stored;
   } catch {
     return undefined;
@@ -276,7 +311,7 @@ const catalogLengths = new LRUCache<string, number>({
 
 function lengthKeyFor(userUUID: string, catalog: CatalogRef, extras: Record<string, string>, tags: string[], keepKey = ''): string {
   const owner = viewerAccountOwner();
-  const viewer = catalog.id.startsWith(SERVER_WATCHLIST_PREFIX) ? viewerProfile() : '';
+  const viewer = catalog.id.startsWith(SERVER_WATCHLIST_PREFIX) || catalog.id.startsWith('recommendations.') ? viewerProfile() : '';
   return `${userUUID}|${catalog.type}|${catalog.id}|${extras.genre ?? ''}|${extras.search ?? ''}|${tags.join(',')}|${keepKey}${owner ? `|@${owner}` : ''}${viewer ? `|#${viewer}` : ''}`;
 }
 
@@ -691,9 +726,10 @@ export function metaToBaseItem(
     ProviderIds: ids,
     ExternalUrls: externalUrls(ids, itemType === 'Series'),
     People: peopleFrom(meta, serverId),
-    Studios: [],
+    Studios: studiosOf(meta),
     Tags: Array.isArray(meta.keywords) ? meta.keywords : [],
-    Taglines: [],
+    Taglines: typeof meta.tagline === 'string' && meta.tagline ? [meta.tagline] : [],
+    ProductionLocations: countriesOf(meta),
     RemoteTrailers: remoteTrailers(meta),
     OriginalLanguage: originalLanguage(meta),
     ImageTags: imageTags,
@@ -709,8 +745,23 @@ export function metaToBaseItem(
     LockData: false,
     ChildCount: itemType === 'BoxSet' && Array.isArray(meta.videos) ? meta.videos.length : null,
     ...(itemType === 'Movie' ? { EnableMediaSourceDisplay: true, MediaSources: placeholderSources(id) } : {}),
-    ...(itemType === 'Series' ? { Status: seriesStatus(meta), EndDate: endDate(meta) } : {}),
+    ...(itemType === 'Series' ? { Status: seriesStatus(meta), EndDate: endDate(meta), ...airScheduleOf(meta) } : {}),
   };
+}
+
+function studiosOf(meta: any): any[] {
+  const names = [...new Set([...(Array.isArray(meta.studios) ? meta.studios : []), ...(Array.isArray(meta.networks) ? meta.networks : [])].filter((name) => typeof name === 'string' && name))];
+  return names.map((name) => ({ Name: name, Id: createHash('md5').update(`studio:${name}`).digest('hex') }));
+}
+
+function countriesOf(meta: any): string[] {
+  if (Array.isArray(meta.countries) && meta.countries.length) return meta.countries.map((country: string) => countryName(String(country)));
+  return typeof meta.country === 'string' ? meta.country.split(', ').filter(Boolean).map(countryName) : [];
+}
+
+function airScheduleOf(meta: any): any {
+  if (!Array.isArray(meta.airDays) || !meta.airDays.length) return {};
+  return { AirDays: meta.airDays, ...(typeof meta.airTime === 'string' && meta.airTime ? { AirTime: meta.airTime } : {}) };
 }
 
 function catalogSettingsFor(config: any, catalog: { id: string; type: string }): any {
@@ -805,6 +856,12 @@ const metaMemo = new LRUCache<string, any>({
   ttl: envInt('JELLYFIN_META_MEMO_TTL', 60, 1) * 1000,
 });
 const metaInFlight = new Map<string, Promise<any | null>>();
+
+function episodeKindExtension(video: any): any {
+  const filler = (video.isFiller ?? video.filler) === true;
+  const recap = (video.isRecap ?? video.recap) === true;
+  return filler || recap ? { aiostreams: { ...(filler ? { filler: true } : {}), ...(recap ? { recap: true } : {}) } } : {};
+}
 
 export async function fetchMeta(
   userUUID: string,
@@ -1089,6 +1146,7 @@ export function buildEpisode(
       RunTimeTicks: parseRuntimeTicks(video.runtime),
       ProviderIds: {},
       Tags: [(video.isFiller ?? video.filler) === true && 'Filler', video.isMixedFiller === true && 'Mixed Canon/Filler', (video.isRecap ?? video.recap) === true && 'Recap'].filter(Boolean),
+      ...(viewerReadsExtensions() ? episodeKindExtension(video) : {}),
       ImageTags: video.thumbnail ? { Primary: imageTag(video.thumbnail) } : {},
       BackdropImageTags: [],
       ImageBlurHashes: {},

@@ -1,5 +1,6 @@
 const { httpGet } = require("./httpClient");
 const { cacheWrapMetaSmart } = require("../lib/getCache");
+const { markUnsettled } = require("../lib/metaMemory");
 const { getMeta } = require("../lib/getMeta");
 const Utils = require("./parseProps");
 const idMapper = require("../lib/id-mapper");
@@ -45,7 +46,7 @@ async function _processAnimeItem(item, provider, id, language, config, includeVi
   }
   const malId = mapping.mal_id;
   const isMovie = item.type === 'movie';
-  const imdbId = isMovie ? idMapper.getTraktAnimeMovieByMalId(malId)?.externals.imdb : mapping.imdb_id;
+  const imdbId = isMovie ? idMapper.filmIdsFor(mapping, { shown: true }).imdbId : mapping.imdb_id;
   if(config.mal?.useImdbIdForCatalogAndSearch && item.type === 'series' && imdbId){
     return (await cacheWrapMetaSmart(config.userUUID, imdbId, async () => {
       return await getMeta(item.type, language, imdbId, config, config.userUUID, includeVideos);
@@ -227,6 +228,7 @@ async function parseStremThruItems(items, type, genreFilter, language, config, i
       return options.upstreamArt ? _withUpstreamArt(result, item) : result;
 
     } catch (error) {
+      markUnsettled();
       logger.error(`Error processing item ${item.id}:`, error.message);
       const fallback = _createFallbackMeta(item, language, config);
       return options.upstreamArt ? _withUpstreamArt(fallback, item) : fallback;

@@ -12,7 +12,7 @@ import { PLAYBACK_MANIFEST_EVENTS, WATCH_STATE_PUSH_EVENTS, WATCH_STATE_VERSION 
 import { watchStatePullTtl } from "./watchState";
 import { collectionCatalogs, collectionsServed, COLLECTION_META_PREFIX } from "./collectionBuilder/aiostreamsCollections";
 import { similarCatalogs } from "./similarCatalog";
-import { holderCards, servesCatalog, withAccountOwner } from "./accounts";
+import { holderCards, rowOwner, servesCatalog, withAccountOwner } from "./accounts";
 import { hasNamedViewers } from "./jellyfin/profiles";
 const jikan: any = require('./mal');
 const DEFAULT_LANGUAGE = "en-US";
@@ -927,7 +927,7 @@ async function getManifest(config: any, opts: { tags?: string[] } = {}): Promise
   const tagSet = new Set(tags.map((t: string) => t.toLowerCase()));
   const jikanEnabled = jikan.isJikanEnabled();
   const enabledCatalogs = userCatalogs.filter((c: any) =>
-    c.enabled && servesCatalog(config, c) && (jikanEnabled || !jikan.isJikanCatalogId(c.id)) && (tagSet.size === 0 || (Array.isArray(c.tags) && c.tags.some((t: any) => tagSet.has(String(t).toLowerCase()))))
+    c.enabled && servesCatalog(config, c) && (jikanEnabled || !jikan.isJikanCatalogId(c.id)) && (tagSet.size === 0 || rowOwner(c) || (Array.isArray(c.tags) && c.tags.some((t: any) => tagSet.has(String(t).toLowerCase()))))
   );
 
   // Absorbed merge sources must be built (even if disabled) so their genres feed the parent.
@@ -1129,7 +1129,7 @@ async function getManifest(config: any, opts: { tags?: string[] } = {}): Promise
       }
       if (userCatalog.id.startsWith('recommendations.')) {
         // Needs a history to read and a model to read it with.
-        const hasHistory = !!(config.apiKeys?.simklTokenId || config.apiKeys?.mdblist);
+        const hasHistory = require('../utils/recommendations/history').canReadHistory(config);
         const hasModel = !!(config.apiKeys?.gemini || config.apiKeys?.openrouter
           || process.env.GEMINI_API_KEY || process.env.BUILT_IN_GEMINI_API_KEY || process.env.OPENROUTER_API_KEY);
         return hasHistory && hasModel;
