@@ -3,6 +3,7 @@ import { pipeline } from 'stream/promises';
 import { LRUCache } from 'lru-cache';
 import consola from 'consola';
 import { envInt } from '../../utils/envNumber';
+import { tmdbBackdropSize, tmdbLandscapeSize, tmdbLogoSize, tmdbPosterSize } from '../../utils/tmdbImageSize';
 import { mapWithConcurrency } from '../../utils/concurrency';
 import { hasAgeRatingCap } from '../../utils/ageRating';
 import { randomUUID, timingSafeEqual } from 'crypto';
@@ -30,7 +31,7 @@ import {
 import { buildViews, catalogView, collectionTypeFor, findCatalogByViewId, getCatalogs, getSearchableCatalogs, isBoxSetCatalog, isBrowsable, requiresGenre, rowFor } from './views';
 import { decodeJellyfinId } from './ids';
 import { artTag, imageTag, isWideTag } from './imageTags';
-import { buildEpisodes, buildSeasons, withSeasonAnimeIds, fetchCatalogPage, fetchMeta, fetchWindow, filterByIncludeTypes, includeTypesFilter, buildEpisode, findEpisodeVideo, knownCatalogLength, metaToBaseItem, pageChildren, pageEpisodes, recallArt, recallImages, rememberArt, rememberImages, sortNameFor, warmCatalogLengths, isLandscapeCatalog, showLandscape } from './items';
+import { buildEpisodes, buildSeasons, withSeasonAnimeIds, fetchCatalogPage, fetchMeta, fetchWindow, servedOrder, filterByIncludeTypes, includeTypesFilter, buildEpisode, findEpisodeVideo, knownCatalogLength, metaToBaseItem, pageChildren, pageEpisodes, recallArt, recallImages, rememberArt, rememberImages, sortNameFor, warmCatalogLengths, isLandscapeCatalog, showLandscape } from './items';
 import { dashedGuid, encodeJellyfinId, normaliseJellyfinId, parseStremioId, stremioIdFor } from './ids';
 import { coalesce, fetchStreams, fileFor, languageCode, languageName, mediaSourceFor, normaliseStreamBase, forgetDuration, placeholderMediaSource, recallDuration, recallFailure, recallIssued, recallStreams, rememberDuration, rememberFailure, rememberStreams, runtimeTicksFrom, streamClient, streamsState, streamUserAgent, toNotice, toPlayable, type StreamClient } from './streams';
 import { fetchAddonSubtitles, formatOf, pickSubtitles, recallOffered, rememberOffered, subtitleBody, subtitleCodecFor, subtitleExtensionOf, subtitleFormatFor, subtitleLanguage, type SubtitleTrack } from './subtitles';
@@ -49,9 +50,11 @@ import { allBoxSets, boxSetGenres, boxSetMembers, boxSetsDeep, boxSetsFor, boxSe
 import { entryItemType, setWatchlisted, watchlistEntries, watchlistItems } from './watchlist';
 import { applyRatings, applyWatchedState, finishedSeries, ownNextUpRows, seriesCountsAmong, upcomingFollowed, watchedAmong, watchedHistory, watchedSnapshot, type NextUpRow, type UpcomingRow } from './watched';
 import { cachedArtwork } from './artwork';
+import { oneIdAsked, withCriticRatings } from './criticRatings';
 import { ImageQueueFull, SIZED_WIDTH, imageQueueFull, inImageSlot, shrinkToWidth, widthStep } from '../posterCache/resize';
 import { IMAGE_CSP } from '../posterCache/proxyResponse';
 import { registerStubs } from './stubs';
+import { noteWantsPeople } from './viewer';
 import { decodeCursor, exportRow, findUser, historyPage, historyUsers, isEpisodeVideo, itemIdForVideo, userByKey, videoIdsOf } from './history';
 import { forgetUserSettings, liveSessionsFor, recordPlayed, recordPlayedUpTo, recordPlaying, recordProgress, recordStopped, recordUnplayed, recordUserData, sessionTouchDue, touchSessions, type LiveSession } from './playstate';
 
@@ -110,11 +113,62 @@ async function locateEpisode(episodes: any[], videoId: string, mediaType: string
   );
 }
 
+async function videoForEpisode(meta: any, descriptor: any): Promise<any | null> {
+  const direct = findEpisodeVideo(meta, descriptor);
+  if (direct) return direct;
+  const { stremioIdFor } = require('./idsCodec');
+  const { videoIdAliases } = require('./aliases');
+  const videoId = stremioIdFor(descriptor);
+  if (!videoId) return null;
+  const wanted = new Set<string>([videoId, ...(await videoIdAliases(videoId))]);
+  return (Array.isArray(meta?.videos) ? meta.videos : []).find((video: any) => wanted.has(String(video?.id))) ?? null;
+}
+
+async function episodeForDescriptor(episodes: any[], descriptor: any, wanted: string, metaId: string): Promise<any | undefined> {
+  const exact = episodes.find((episode: any) => episode.Id === wanted);
+  if (exact) return exact;
+  const { stremioIdFor } = require('./idsCodec');
+  const videoId = stremioIdFor(descriptor);
+  if (videoId) {
+    const linked = await locateEpisode(episodes, videoId, descriptor.t, metaId);
+    if (linked) return linked;
+  }
+  return episodes.find((episode: any) => episode.IndexNumber === descriptor.e && episode.ParentIndexNumber === descriptor.s);
+}
+
+// The episode a video id names, built alone when it names one exactly; anything
+// looser builds the series and locates as locateEpisode always has.
+async function locateOneEpisode(meta: any, mediaType: string, seriesId: string, serverId: string, videoId: string): Promise<any | undefined> {
+  const parsed = parseStremioId(videoId);
+  if (parsed) {
+    const descriptor: any = { k: 'episode', t: mediaType, i: parsed.base, s: parsed.season, e: parsed.episode as number };
+    const video = findEpisodeVideo(meta, descriptor);
+    if (video) {
+      const episode = buildEpisode(meta, video, mediaType, seriesId, serverId);
+      if (episode.Id === encodeJellyfinId(descriptor)) return episode;
+    }
+  }
+  return locateEpisode(buildEpisodes(meta, mediaType, seriesId, serverId, null), videoId, mediaType, String(meta.id));
+}
+
+// Builds only the episode an id names; anything short of an exact match builds
+// the whole series and matches as episodeForDescriptor always has.
+async function episodeItemFor(meta: any, descriptor: any, seriesId: string, serverId: string, wanted: string): Promise<any | undefined> {
+  const video = findEpisodeVideo(meta, descriptor);
+  if (video) {
+    const episode = buildEpisode(meta, video, descriptor.t, seriesId, serverId);
+    if (episode.Id === wanted) return episode;
+  }
+  const episodes = buildEpisodes(meta, descriptor.t, seriesId, serverId, null);
+  return episodeForDescriptor(episodes, descriptor, wanted, String(meta.id));
+}
+
 // An anime episode's id names its own entry; the library may group the show under an IMDb id.
 async function seriesForEpisode(userUUID: string, config: any, descriptor: any): Promise<{ meta: any; seriesId: string } | null> {
   const idMapper: any = require('../id-mapper');
   const perEntry = /^(kitsu|mal|anilist|anidb):/.test(String(descriptor.i));
-  const grouped = perEntry && config?.providers?.anime !== 'kitsu' && config?.providers?.anime !== 'mal';
+  const { perEntryAnime } = require('./watchlistSources');
+  const grouped = perEntry && !perEntryAnime(config);
   if (grouped) {
     const numeric = parseInt(String(descriptor.i).split(':')[1], 10);
     const mapping = String(descriptor.i).startsWith('kitsu:') ? idMapper.getMappingByKitsuId(numeric)
@@ -124,7 +178,7 @@ async function seriesForEpisode(userUUID: string, config: any, descriptor: any):
     const imdb = mapping?.imdb_id;
     if (imdb) {
       const meta = await fetchMeta(userUUID, 'series', String(imdb));
-      if (meta && findEpisodeVideo(meta, descriptor)) {
+      if (meta && (await videoForEpisode(meta, descriptor))) {
         return { meta, seriesId: encodeJellyfinId({ k: 'series', t: descriptor.t, i: String(meta.id) }) };
       }
     }
@@ -145,9 +199,8 @@ async function nowPlayingItem(userUUID: string, config: any, serverId: string, i
   if (descriptor?.k !== 'episode') return null;
   const found = await seriesForEpisode(userUUID, config, descriptor);
   if (!found) return null;
-  const episodes = buildEpisodes(found.meta, descriptor.t, found.seriesId, serverId, null);
   const wanted = normaliseJellyfinId(itemId);
-  return episodes.find((e: any) => e.Id === wanted) ?? episodes.find((e: any) => e.IndexNumber === descriptor.e && e.ParentIndexNumber === descriptor.s) ?? null;
+  return (await episodeItemFor(found.meta, descriptor, found.seriesId, serverId, wanted)) ?? null;
 }
 
 type ActivityCounts = { byKey: Map<string, any>; favourites: Map<string, number> };
@@ -455,9 +508,16 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       logger.debug(`${req.method} ${String(req.originalUrl || '').split('?')[0]} ${res.statusCode} ${Date.now() - started}ms from ${from}`);
     });
     const appleTv = APPLE_TV.test(info.client) || APPLE_TV.test(info.device);
-    res.json = (body: any) => {
+    const send = (body: any) => {
+      if (res.headersSent) return res;
       if (!res.get('Content-Type')) res.set('Content-Type', 'application/json');
       return res.send(JSON.stringify(body, jsonReplacer(appleTv)));
+    };
+    res.json = (body: any) => {
+      const rating = res.statusCode < 300 ? withCriticRatings(body, oneIdAsked(req.query)) : null;
+      if (!rating) return send(body);
+      rating.then(() => send(body), () => send(body));
+      return res;
     };
     next();
   });
@@ -1103,8 +1163,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         const meta = await seriesIndex(userUUID, entry.metaId);
         if (!meta) return null;
         const mediaType = entry.mediaType === 'anime' ? 'anime' : 'series';
-        const episodes = buildEpisodes(meta, mediaType, encodeJellyfinId({ k: 'series', t: mediaType, i: String(meta.id) }), serverId, null);
-        return (await locateEpisode(episodes, entry.id, mediaType, String(meta.id))) ?? null;
+        return (await locateOneEpisode(meta, mediaType, encodeJellyfinId({ k: 'series', t: mediaType, i: String(meta.id) }), serverId, entry.id)) ?? null;
       });
       const items = built.filter(Boolean);
       await applyWatchedState(items, snapshot, userUUID, profile);
@@ -1288,7 +1347,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         ).catch(() => ({ items: [] as any[], hasMore: false }));
 
         const viewId = encodeJellyfinId({ k: 'view', t: catalog.type, c: catalog.id });
-        for (const meta of page.items) {
+        for (const meta of servedOrder(page.items, page)) {
           if (!meta?.id || collected.length >= limit) continue;
           collected.push(metaToBaseItem(meta, catalog.type, serverId, viewId));
         }
@@ -1387,7 +1446,10 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         const ahead = children.slice(startIndex, startIndex + folderLimit);
         const titlesFrom = Math.max(0, startIndex - children.length);
         const room = folderLimit - ahead.length;
-        const page = room > 0
+        const foldersOnly = wantedTypes.length > 0 && wantedTypes.every((t) => t === 'BoxSet');
+        const page = foldersOnly
+          ? { items: [], hasMore: false }
+          : room > 0
           ? await boxSetMembers(userUUID, config, serverId, collection, folder, titlesFrom, room, includeItemTypes ? String(includeItemTypes) : undefined, extras.genre)
           : { items: [], hasMore: true };
         await applyWatchedState(page.items, await watchedSnapshot(userUUID, config), userUUID, profileKey(config), config);
@@ -1458,7 +1520,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     );
     const hasMore = window.hasMore;
 
-    const items = window.items
+    const items = servedOrder(window.items, window)
       .filter((meta: any) => meta && meta.id)
       .map((meta: any) => metaToBaseItem(meta, catalog.type, serverId, String(parentId)));
     if (isLandscapeCatalog(config, catalog)) showLandscape(items);
@@ -2297,9 +2359,11 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     if (descriptor.k === 'episode') {
       const meta = await fetchMeta(userUUID, 'series', descriptor.i);
       if (!meta) return undefined;
-      const video = findEpisodeVideo(meta, descriptor);
-      if (video) buildEpisode(meta, video, descriptor.t, encodeSeriesId(descriptor), scope);
-      return (await recallImages(scope, itemId)) ?? { primary: meta.poster || undefined };
+      const video = await videoForEpisode(meta, descriptor);
+      const built = video ? buildEpisode(meta, video, descriptor.t, encodeSeriesId(descriptor), scope) : null;
+      return (await recallImages(scope, itemId))
+        ?? (built?.Id && built.Id !== itemId ? await recallImages(scope, String(built.Id)) : undefined)
+        ?? { primary: meta.poster || undefined };
     }
 
     if (descriptor.k === 'collection' || descriptor.k === 'boxset') {
@@ -2338,7 +2402,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     const chain: any[] = [];
 
     if (descriptor.k === 'episode') {
-      const video = findEpisodeVideo(meta, descriptor);
+      const video = await videoForEpisode(meta, descriptor);
       const number = (Number.isInteger(video?.season) ? video.season : null) ?? descriptor.s;
       const season = number === null || number === undefined
         ? null
@@ -2372,7 +2436,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       return;
     }
     const maxWidth = qInt(req, 'MaxWidth', 0) || qInt(req, 'FillWidth', 0) || qInt(req, 'Width', 0);
-    url = sourceSized(url, kind, maxWidth);
+    url = sourceSized(url, kind, maxWidth, clientListed(req, 'JELLYFIN_RASTER_LOGO_CLIENTS'));
     const descriptor = await decodeJellyfinId(String(req.params.itemId));
     const collectionArt = descriptor?.k === 'collection' || descriptor?.k === 'boxset';
 
@@ -2382,6 +2446,11 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       const local = builtinPosterCachePath(cached);
       if (local) {
         const step = hasRenditions(url) ? null : widthStep(maxWidth);
+        const unstored = step ? unstoredSource(local) : null;
+        if (unstored) {
+          await sizedArtwork(req, res, unstored, step!, relaying);
+          return;
+        }
         await serveFromPosterCache(req, res, local, cached, step);
         return;
       }
@@ -2425,15 +2494,26 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     background: { small: 480, medium: 1920, large: 1920 },
   };
 
-  /** Hosts that publish each image at several sizes, so a smaller one is a link rather than a resize. */
+  const FANART = 'https://assets.fanart.tv/fanart/';
+  const FANART_PREVIEW = 'https://assets.fanart.tv/preview/';
+  const FANART_PREVIEW_WIDTH = 200;
+
+  /** Hosts whose smaller copy is picked to fit the width asked for, so a resize would gain nothing. */
   const hasRenditions = (url: string): boolean =>
-    url.startsWith('https://image.tmdb.org/t/p/') || url.startsWith(TVDB) || METAHUB.test(url);
+    url.startsWith('https://image.tmdb.org/t/p/') || METAHUB.test(url) || url.startsWith(FANART_PREVIEW);
+
+  const TMDB_SVG = /(image\.tmdb\.org\/t\/p\/[^/]+\/[^/?#]+)\.svg(?=$|[?#])/i;
 
   /** The source's own smallest rendition at least as wide as asked, never larger than the link names. */
-  const sourceSized = (url: string, kind: string, maxWidth: number): string => {
+  const sourceSized = (url: string, kind: string, maxWidth: number, raster = false): string => {
+    if (raster) url = url.replace(TMDB_SVG, '$1.png');
     if (url.includes(TMDB_ORIGINAL)) {
       const bucket = kind === 'logo' ? 'logo' : kind === 'backdrop' || kind === 'thumb' ? 'backdrop' : 'poster';
       const widths = TMDB_WIDTHS[bucket];
+      if (!(maxWidth > 0)) {
+        const preferred = kind === 'thumb' ? tmdbLandscapeSize() : bucket === 'backdrop' ? tmdbBackdropSize() : bucket === 'logo' ? tmdbLogoSize() : tmdbPosterSize();
+        if (preferred === 'original') return url;
+      }
       const wanted = maxWidth > 0 ? maxWidth : bucket === 'backdrop' ? 1280 : bucket === 'logo' ? 500 : 780;
       const width = widths.find((w) => w >= wanted);
       return width ? url.replace(TMDB_ORIGINAL, `https://image.tmdb.org/t/p/w${width}/`) : url;
@@ -2443,6 +2523,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       const thumb = TVDB_THUMBS.find(([path]) => path.test(url));
       return thumb && maxWidth <= thumb[1] ? url.replace(/(\.\w+)$/, '_t$1') : url;
     }
+    if (url.startsWith(FANART) && kind !== 'logo' && maxWidth <= FANART_PREVIEW_WIDTH) return url.replace(FANART, FANART_PREVIEW);
     const metahub = METAHUB.exec(url);
     if (metahub) {
       const [prefix, kindName, size] = metahub;
@@ -2485,18 +2566,22 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       });
     });
 
-  const relaysImages = (req: any): boolean => {
-    const { getSetting } = require('../settingsService');
-    const mode = String(getSetting('JELLYFIN_IMAGE_DELIVERY') || 'auto').trim().toLowerCase();
-    if (mode === 'relay') return true;
-    if (mode === 'redirect') return false;
-    const names = String(getSetting('JELLYFIN_IMAGE_RELAY_CLIENTS') || '')
+  const clientListed = (req: any, key: string): boolean => {
+    const names = String(require('../settingsService').getSetting(key) || '')
       .split(',')
       .map((name) => name.trim().toLowerCase())
       .filter(Boolean);
     if (!names.length) return false;
     const seen = `${clientInfo(req).client} ${req.get('user-agent') || ''}`.toLowerCase();
     return names.some((name) => seen.includes(name));
+  };
+
+  const relaysImages = (req: any): boolean => {
+    const { getSetting } = require('../settingsService');
+    const mode = String(getSetting('JELLYFIN_IMAGE_DELIVERY') || 'auto').trim().toLowerCase();
+    if (mode === 'relay') return true;
+    if (mode === 'redirect') return false;
+    return clientListed(req, 'JELLYFIN_IMAGE_RELAY_CLIENTS');
   };
 
   const imageSetting = (key: string, fallback: number, min: number): number => {
@@ -2553,37 +2638,45 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     }
   };
 
+  const sourceImage = async (url: string): Promise<{ body: Buffer; contentType: string }> => {
+    const { openImageStream } = require('../posterCache/upstream');
+    const { getMaxObjectBytes } = require('../posterCache/config');
+    const upstream = await openImageStream(url);
+    if (upstream.notModified) throw new Error('not modified');
+    const limit = getMaxObjectBytes();
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    for await (const chunk of upstream.response.data) {
+      bytes += chunk.length;
+      if (bytes > limit) {
+        upstream.response.data.destroy();
+        throw new Error(`larger than ${limit} bytes`);
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+    return { body: Buffer.concat(chunks), contentType: upstream.contentType };
+  };
+
+  const sendArtwork = (res: any, image: { body: Buffer; contentType: string }): void => {
+    res.set('Content-Type', image.contentType);
+    res.set('Content-Security-Policy', IMAGE_CSP);
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.end(image.body);
+  };
+
   const shapedPoster = async (req: any, res: any, url: string, maxWidth: number, relaying: boolean): Promise<void> => {
     try {
       const image = await cachedArtwork(`${url}|${widthStep(maxWidth) ?? 0}|shaped`, async () => {
         if (imageQueueFull()) throw new ImageQueueFull();
-        const { openImageStream } = require('../posterCache/upstream');
-        const { getMaxObjectBytes } = require('../posterCache/config');
         const { shapePoster } = require('../posterCache/shape');
-        const upstream = await openImageStream(url);
-        if (upstream.notModified) throw new Error('not modified');
-        const limit = getMaxObjectBytes();
-        const chunks: Buffer[] = [];
-        let bytes = 0;
-        for await (const chunk of upstream.response.data) {
-          bytes += chunk.length;
-          if (bytes > limit) {
-            upstream.response.data.destroy();
-            throw new Error(`larger than ${limit} bytes`);
-          }
-          chunks.push(Buffer.from(chunk));
-        }
-        const source = Buffer.concat(chunks);
+        const source = await sourceImage(url);
         return inImageSlot(async () => {
-          const shaped = await shapePoster(source, upstream.contentType);
+          const shaped = await shapePoster(source.body, source.contentType);
           const step = widthStep(maxWidth);
           return step ? shrinkToWidth(shaped.body, shaped.contentType, step) : shaped;
-        });
+        }, source.body.length);
       });
-      res.set('Content-Type', image.contentType);
-      res.set('Content-Security-Policy', IMAGE_CSP);
-      res.set('Cache-Control', 'public, max-age=86400');
-      res.end(image.body);
+      sendArtwork(res, image);
     } catch (error: any) {
       if (error instanceof ImageQueueFull) {
         if (relaying) await relayImage(req, res, url);
@@ -2592,6 +2685,28 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       }
       logger.debug(`Image stream failed for ${url}: ${error?.message || error}`);
       res.status(404).end();
+    }
+  };
+
+  const unstoredSource = (path: string): string | null => {
+    const posterCache = require('../posterCache/config');
+    const match = /^\/([a-z]+)\/(https?:\/\/.+)$/i.exec(path.slice(posterCache.POSTER_CACHE_ROUTE.length));
+    if (!match || !posterCache.isValidImageClass(match[1]) || posterCache.isClassEnabled(match[1])) return null;
+    return match[2];
+  };
+
+  const sizedArtwork = async (req: any, res: any, url: string, step: number, relaying: boolean): Promise<void> => {
+    try {
+      const image = await cachedArtwork(`${url}|${step}|sized`, async () => {
+        if (imageQueueFull()) throw new ImageQueueFull();
+        const source = await sourceImage(url);
+        return inImageSlot(() => shrinkToWidth(source.body, source.contentType, step), source.body.length);
+      });
+      sendArtwork(res, image);
+    } catch (error: any) {
+      if (!(error instanceof ImageQueueFull)) logger.debug(`Image resize failed for ${url}: ${error?.message || error}`);
+      if (relaying) await relayImage(req, res, url);
+      else res.redirect(302, url);
     }
   };
 
@@ -2648,7 +2763,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     const serverId = serverIdFor(userUUID);
     const played = await playedPick(req, userUUID, config, catalog.type, serverId, String(parentId));
     const window = await fetchWindow(userUUID, catalog, 0, limit, {}, undefined, profileTags(config), played.key, played.pick);
-    const items = window.items
+    const items = servedOrder(window.items, window)
       .filter((meta: any) => meta && meta.id)
       .map((meta: any) => metaToBaseItem(meta, catalog.type, serverId, String(parentId)));
     if (isLandscapeCatalog(config, catalog)) showLandscape(items);
@@ -2725,14 +2840,12 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       if (!parsed) continue;
 
       // An episode the index lacks may have aired since it was read.
-      let episodes = buildEpisodes(meta, row.mediaType, encodeJellyfinId({ k: 'series', t: row.mediaType, i: String(meta.id) }), serverId, null);
-      let target = await locateEpisode(episodes, row.videoId, row.mediaType, String(meta.id));
+      let target = await locateOneEpisode(meta, row.mediaType, encodeJellyfinId({ k: 'series', t: row.mediaType, i: String(meta.id) }), serverId, row.videoId);
       if (!target) {
         const fresh = await refreshSeriesIndex(userUUID, row.metaId);
         if (fresh) {
           meta = fresh;
-          episodes = buildEpisodes(meta, row.mediaType, encodeJellyfinId({ k: 'series', t: row.mediaType, i: String(meta.id) }), serverId, null);
-          target = await locateEpisode(episodes, row.videoId, row.mediaType, String(meta.id));
+          target = await locateOneEpisode(meta, row.mediaType, encodeJellyfinId({ k: 'series', t: row.mediaType, i: String(meta.id) }), serverId, row.videoId);
         }
       }
       if (!target) {
@@ -2899,11 +3012,14 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       for (const row of ownRows) if (snapshot.dropped.has(row.metaId)) trace(row, 'server', { outcome: 'dropped' });
       for (const row of snapshot.nextUp) if (snapshot.dropped.has(row.metaId)) trace(row, 'tracker', { outcome: 'dropped' });
     }
-    const sourceOf = (row: any): NextUpSource => (own.includes(row) ? 'server' : snapshot.nextUp.includes(row) ? 'tracker' : 'sequel');
+    const { homedRows } = require('./episodeHome');
+    const home = <T extends { metaId: string; videoId?: string | null; mediaType: string }>(rows: T[]): Promise<T[]> => homedRows(userUUID, config, rows);
+    const trackerRows = await home(snapshot.nextUp.filter((row) => !snapshot.dropped.has(row.metaId)));
+    const sourceOf = (row: any): NextUpSource => (own.includes(row) ? 'server' : trackerRows.includes(row) ? 'tracker' : 'sequel');
     // One row per resolved show; the table's newest spelling first.
     const animeOnly = keepsAnimeOnly(config) && !(req.query.SeriesId ?? req.query.seriesId ?? req.query.ParentId ?? req.query.parentId);
-    const sequels = (await animeSequels(snapshot)).nextUp;
-    const offered = [...[...own].sort((a, b) => b.lastWatchedAt - a.lastWatchedAt), ...snapshot.nextUp.filter((row) => !snapshot.dropped.has(row.metaId)), ...sequels]
+    const sequels = await home((await animeSequels(snapshot)).nextUp);
+    const offered = [...[...own].sort((a, b) => b.lastWatchedAt - a.lastWatchedAt), ...trackerRows, ...sequels]
       .filter((row) => {
         if (!animeOnly || isAnimeTitle(row.metaId, 'series')) return true;
         trace?.(row, sourceOf(row), { outcome: 'not-anime' });
@@ -2914,7 +3030,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       identities.set(metaId, await showIdentity(metaId, config));
     });
     const trackerTimes = new Map<string, Omit<NextUpRow, 'lastWatchedAt'>>();
-    for (const row of [...snapshot.nextUp, ...(await followedTimes)]) {
+    for (const row of [...trackerRows, ...(await home(await followedTimes))]) {
       if ((row.airsAt || row.aired) && !trackerTimes.has(row.metaId)) trackerTimes.set(row.metaId, row);
     }
     const taken = new Set<string>();
@@ -2928,7 +3044,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       .sort((a, b) => b.lastWatchedAt - a.lastWatchedAt);
     const sources = new Map(offered.map((row) => [row, sourceOf(row)]));
     const trackerRanks = new Map<string, number>();
-    for (const row of snapshot.nextUp) {
+    for (const row of trackerRows) {
       const identity = identities.get(row.metaId) ?? row.metaId;
       if (Number.isFinite(row.trackerRank) && !trackerRanks.has(identity)) trackerRanks.set(identity, row.trackerRank!);
     }
@@ -3078,8 +3194,10 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         return;
       }
       if (Number.isFinite(airedAt) && airedAt !== Date.parse(next.PremiereDate || '')) next.PremiereDate = new Date(airedAt).toISOString();
+      const startedAt = Date.parse(next.UserData?.LastPlayedDate || '');
       items[index] = next;
-      availableAt[index] = Math.max(row.lastWatchedAt || 0, Number.isFinite(airedAt) ? airedAt : 0);
+      availableAt[index] = Math.max(row.lastWatchedAt || 0, Number.isFinite(airedAt) ? airedAt : 0, Number.isFinite(startedAt) ? startedAt : 0);
+      if (availableAt[index] > 0) next.UserData = { ...next.UserData, LastPlayedDate: new Date(availableAt[index]).toISOString() };
       await traced({ outcome: 'shown', next: episodeLabel(next) });
     });
 
@@ -3133,15 +3251,21 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
   // Tracker-followed shows are all checked; watchlisted and locally known ones are capped.
   const showsInView = async (userUUID: string, config: any, days: number) => {
     const watchlistLimit = envInt('JELLYFIN_UPCOMING_WATCHLIST_LIMIT', 100, 1);
-    const [snapshot, resume, own, caughtUp, listed] = await Promise.all([
+    const [snapshot, resume, own, followedFeed, listed] = await Promise.all([
       watchedSnapshot(userUUID, config),
       resumeSnapshot(userUUID, config),
       ownNextUpRows(userUUID, profileKey(config)),
       upcomingFollowed(config, days),
       watchlistEntries(userUUID, config, watchlistLimit).catch(() => ({ entries: [] as any[] })),
     ]);
+    const { homedRows } = require('./episodeHome');
+    const [trackerRows, caughtUp, following] = await Promise.all([
+      homedRows(userUUID, config, snapshot.nextUp) as Promise<NextUpRow[]>,
+      homedRows(userUUID, config, followedFeed) as Promise<UpcomingRow[]>,
+      homedRows(userUUID, config, snapshot.following) as Promise<typeof snapshot.following>,
+    ]);
     const shows = new Map<string, string>();
-    for (const row of [...caughtUp, ...snapshot.following]) {
+    for (const row of [...caughtUp, ...following]) {
       if (!shows.has(row.metaId)) shows.set(row.metaId, row.mediaType);
     }
     const watchlisted = listed.entries
@@ -3152,15 +3276,15 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     }
     let local = 0;
     const localCap = envInt('JELLYFIN_UPCOMING_LOCAL_SHOWS', 60, 0);
-    for (const row of [...own, ...snapshot.nextUp, ...resume.filter((r) => r.kind === 'episode')].filter((r) => !snapshot.dropped.has(r.metaId))) {
+    for (const row of [...own, ...trackerRows, ...resume.filter((r) => r.kind === 'episode')].filter((r) => !snapshot.dropped.has(r.metaId))) {
       if (shows.has(row.metaId)) continue;
       if (local >= localCap) break;
       shows.set(row.metaId, row.mediaType);
       local += 1;
     }
     const followed = [...shows.entries()].filter(([metaId]) => !keepsAnimeOnly(config) || isAnimeTitle(metaId, 'series'));
-    const sequels = (await animeSequels(snapshot)).upcoming.filter((row) => !shows.has(row.metaId));
-    return { snapshot, caughtUp, followed, sequels };
+    const sequels = (await homedRows(userUUID, config, (await animeSequels(snapshot)).upcoming) as UpcomingRow[]).filter((row) => !shows.has(row.metaId));
+    return { snapshot, caughtUp, followed, sequels, trackerRows };
   };
 
   const onePerEpisode = async (episodes: any[], config: any): Promise<any[]> => {
@@ -3193,8 +3317,9 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       seen.add(identity);
       const premiere = new Date(row.airsAt as number).toISOString();
       const seriesId = encodeJellyfinId({ k: 'series', t: row.mediaType, i: String(meta.id) });
-      const episodes = buildEpisodes(meta, row.mediaType, seriesId, serverId, null);
-      const episode = (row.videoId ? await locateEpisode(episodes, row.videoId, row.mediaType, String(meta.id)) : episodes.find((e: any) => e.IndexNumber === row.episode))
+      const episode = (row.videoId
+        ? await locateOneEpisode(meta, row.mediaType, seriesId, serverId, row.videoId)
+        : buildEpisodes(meta, row.mediaType, seriesId, serverId, null).find((e: any) => e.IndexNumber === row.episode))
         ?? episodeFromDate(meta, row, premiere, seriesId, serverId);
       episode.PremiereDate = premiere;
       out.push(episode);
@@ -3267,9 +3392,24 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
 
   const heldCalendar = async (userUUID: string, config: any, from: number, to: number, withFilms = false): Promise<any[]> => {
     const digest = (await watchedSnapshot(userUUID, config)).fingerprint;
-    const memoKey = `${userUUID}:${profileKey(config)}:calendar:${from}:${to}:${digest}${withFilms ? ':films' : ''}`;
-    return memoNextUp(userUUID, memoKey, () => buildCalendar(userUUID, config, from, to, withFilms), (built) =>
-      built.length === 0 ? Date.now() + envInt('JELLYFIN_CALENDAR_EMPTY_TTL', 30, 1) * 1000 : null);
+    const blockMs = envInt('JELLYFIN_CALENDAR_BLOCK_DAYS', 120, 7) * 24 * 60 * 60 * 1000;
+    const starts: number[] = [];
+    for (let start = Math.floor(from / blockMs) * blockMs; start <= to; start += blockMs) starts.push(start);
+    let whole: Promise<any[]> | null = null;
+    const span = () => (whole ??= buildCalendar(userUUID, config, starts[0], starts[starts.length - 1] + blockMs - 1, withFilms));
+    const blocks = await Promise.all(starts.map((start) => {
+      const memoKey = `${userUUID}:${profileKey(config)}:calendar:${start}:${blockMs}:${digest}${withFilms ? ':films' : ''}`;
+      const inBlock = (item: any) => {
+        const at = Date.parse(item?.PremiereDate || '');
+        return at >= start && at < start + blockMs;
+      };
+      return memoNextUp(userUUID, memoKey, async () => (await span()).filter(inBlock), (built) =>
+        built.length === 0 ? Date.now() + envInt('JELLYFIN_CALENDAR_EMPTY_TTL', 30, 1) * 1000 : null);
+    }));
+    return blocks.flat().filter((item) => {
+      const at = Date.parse(item?.PremiereDate || '');
+      return at >= from && at <= to;
+    });
   };
   calendarReader = heldCalendar;
 
@@ -3277,9 +3417,9 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     const serverId = serverIdFor(userUUID);
     const profile = profileKey(config);
     const premiereAt = (item: any): number => Date.parse(item?.PremiereDate || '');
-    const { snapshot, caughtUp, followed, sequels } = await showsInView(userUUID, config, envInt('JELLYFIN_UPCOMING_DAYS', 90, 1));
+    const { snapshot, caughtUp, followed, sequels, trackerRows } = await showsInView(userUUID, config, envInt('JELLYFIN_UPCOMING_DAYS', 90, 1));
     const timed = new Map<string, Array<{ videoId?: string | null; season: number | null; episode: number; airsAt: number }>>();
-    for (const row of [...snapshot.nextUp, ...caughtUp]) {
+    for (const row of [...trackerRows, ...caughtUp]) {
       if (!row.airsAt) continue;
       const list = timed.get(row.metaId) || [];
       list.push({ videoId: row.videoId, season: row.season ?? null, episode: row.episode, airsAt: row.airsAt });
@@ -3345,7 +3485,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     const lately = (at: number): boolean => Number.isFinite(at) && at <= now && at > now - holdMs;
     const airing = upcomingMode(config) === 'airing';
 
-    const { snapshot, caughtUp, followed, sequels } = await showsInView(userUUID, config, days);
+    const { snapshot, caughtUp, followed, sequels, trackerRows } = await showsInView(userUUID, config, days);
 
     let nextUpShows: Promise<Set<string>> | null = null;
     const inNextUp = async (metaId: string): Promise<boolean> => {
@@ -3370,7 +3510,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       return (await nextUpShows).has(await showIdentity(metaId, config));
     };
     const named = new Map<string, NextUpRow>();
-    for (const row of snapshot.nextUp) if (row.airsAt || row.aired) named.set(row.metaId, row);
+    for (const row of trackerRows) if (row.airsAt || row.aired) named.set(row.metaId, row);
     // MDBList names each followed show's next episode and when it airs, in progress or not,
     // so its time is used only once the show passes the caught-up check below.
     const timed = new Map<string, (typeof caughtUp)[number]>();
@@ -3591,6 +3731,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
   });
 
   async function singleItemHandler(req: any, res: any): Promise<void> {
+    if (!req.params.listed) noteWantsPeople(true);
     const userUUID = req.params.userUUID;
     const descriptor = await decodeJellyfinId(req.params.itemId);
     if (!descriptor) {
@@ -3623,11 +3764,8 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       const { meta, seriesId } = found;
       // Numbering can differ between the series meta and the one an episode's
       // own id resolves to, so the guid is matched rather than the index.
-      const episodes = buildEpisodes(meta, descriptor.t, seriesId, serverIdFor(userUUID), null);
       const wanted = normaliseJellyfinId(String(req.params.itemId));
-      const episode =
-        episodes.find((e: any) => e.Id === wanted) ??
-        episodes.find((e: any) => e.IndexNumber === descriptor.e && e.ParentIndexNumber === descriptor.s);
+      const episode = await episodeItemFor(meta, descriptor, seriesId, serverIdFor(userUUID), wanted);
       if (!episode) {
         res.status(404).json({ Message: 'Item not found' });
         return;

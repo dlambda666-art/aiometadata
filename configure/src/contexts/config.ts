@@ -1,4 +1,4 @@
-import type { BuilderEntry } from '@shared/types';
+import type { BuilderEntry, CatalogRowOptions } from '@shared/types';
 
 export type TagColorKey =
   | 'blue' | 'green' | 'red' | 'violet' | 'amber' | 'cyan'
@@ -98,6 +98,7 @@ export interface CatalogConfig {
   pageSize?: number;
   /** If set, this catalog is absorbed into a merged catalog and hidden from UI/manifest */
   mergedInto?: string;
+  row?: CatalogRowOptions;
   // List metadata (item count, privacy, author, description, AniList-specific fields, Trakt Up Next settings, Letterboxd-specific fields, TMDB-specific fields)
   metadata?: {
     itemCount?: number;
@@ -112,6 +113,7 @@ export interface CatalogConfig {
     useUpstreamArt?: boolean;
     // Trakt Up Next metadata
     useShowPosterForUpNext?: boolean;
+    upNextSort?: 'watched' | 'aired';
     includeAnimeInUpNext?: boolean;
     // Trakt Calendar metadata
     airingSoonDays?: number;
@@ -148,6 +150,7 @@ export interface CatalogConfig {
     interval?: 'today' | 'week' | 'month';
     pageSize?: number; // Results per page for Simkl trending and watchlist catalogs (default: 50)
     status?: 'watching' | 'plantowatch' | 'hold' | 'completed' | 'dropped'; // Status for Simkl watchlist catalogs
+    watchlistSort?: 'added' | 'released' | 'released_asc';
     /** Source references for merged catalogs (id starts with 'merged.') */
     mergedSources?: Array<{
       catalogId: string;       // source catalog id, e.g. "tmdb.top"
@@ -229,6 +232,7 @@ export interface AppConfig {
   showPrefix: boolean;
   showMetaProviderAttribution: boolean;
   hideErrors?: boolean;
+  criticRatings?: boolean;
   castCount: number;
   displayAgeRating: boolean;
   contentRatingCountry?: string;
