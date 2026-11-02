@@ -12,7 +12,7 @@ import { Callout } from '@/components/settings/Callout';
 import { SettingRow } from '@/components/settings/SettingRow';
 import { useConfig } from '@/contexts/ConfigContext';
 import type { AppConfig, CatalogConfig } from '@/contexts/config';
-import { GEMINI_MODELS, resolveGeminiModel } from '@/data/ai-models';
+import { GEMINI_MODELS, isPresetModel, resolveCatalogModel, resolveGeminiModel } from '@/data/ai-models';
 import { useOpenRouterModels } from '@/hooks/useOpenRouterModels';
 
 /**
@@ -185,14 +185,19 @@ export function RecommendationsIntegration({ isOpen, onClose }: { isOpen: boolea
   }, [isOpen, hasModel, configId, anyRunning, draftKey, viewerKey, auth.password]);
 
   // Polled only while something is running, and stopped as soon as nothing is.
+  const polled = JSON.stringify([...new Set(Object.entries(jobs)
+    .filter(([, job]) => job.stage !== 'done' && job.stage !== 'error')
+    .map(([key]) => key.split('|')[0]))].sort());
   useEffect(() => {
-    if (!isOpen || !configId || !anyRunning) return;
+    const keys: string[] = JSON.parse(polled);
+    if (!isOpen || !configId || !keys.length) return;
     let cancelled = false;
-    const keys = [...new Set(Object.keys(jobs).map(key => key.split('|')[0]))];
     const tick = () => {
       for (const key of keys) {
         fetch(`/api/recommendations/jobs?userUUID=${encodeURIComponent(configId)}`
-          + (key ? `&profile=${encodeURIComponent(key)}` : ''))
+          + (key ? `&profile=${encodeURIComponent(key)}` : ''), {
+          headers: auth.password ? { 'x-config-password': auth.password } : undefined,
+        })
           .then(response => (response.ok ? response.json() : null))
           .then(payload => {
             if (cancelled || !payload?.jobs) return;
@@ -214,8 +219,7 @@ export function RecommendationsIntegration({ isOpen, onClose }: { isOpen: boolea
     const timer = setInterval(tick, 1500);
     tick();
     return () => { cancelled = true; clearInterval(timer); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen, configId, anyRunning]);
+  }, [isOpen, configId, polled, auth.password]);
 
   // A build carries the settings it was started with, so changing them retires
   // its result without throwing away a run that is still going.
@@ -251,6 +255,10 @@ export function RecommendationsIntegration({ isOpen, onClose }: { isOpen: boolea
   const generate = (id: string, force: boolean) => {
     if (!configId) return;
     const key = `${viewerKey}|${id}`;
+    const fail = (error: string) => setJobs(existing => ({
+      ...existing,
+      [key]: { catalogId: id, stage: 'error', picks: 0, error, stamp: draftKey },
+    }));
     setJobs(existing => ({ ...existing, [key]: { catalogId: id, stage: 'queued', picks: 0, stamp: draftKey } }));
     fetch('/api/recommendations/generate', {
       method: 'POST',
@@ -263,12 +271,12 @@ export function RecommendationsIntegration({ isOpen, onClose }: { isOpen: boolea
         force,
         ...(viewerKey ? { profile: viewerKey } : {}),
       }),
-    }).catch(() => {
-      setJobs(existing => ({
-        ...existing,
-        [key]: { catalogId: id, stage: 'error', picks: 0, error: 'Could not start', stamp: draftKey },
-      }));
-    });
+    }).then(async response => {
+      if (response.ok) return;
+      if (response.status === 401) return fail('Enter this configuration\'s password, or sign in, to build rows');
+      const payload = await response.json().catch(() => null);
+      fail(payload?.error || 'Could not start');
+    }).catch(() => fail('Could not start'));
   };
 
   const readyToAdd = OFFERED.filter(({ id }) => (current[id]?.stage === 'done' || mainJobs[id]?.stage === 'done') && !added.has(id));
@@ -302,6 +310,8 @@ export function RecommendationsIntegration({ isOpen, onClose }: { isOpen: boolea
   const currentModel = usingOpenRouter
     ? draft.openrouter_model || ''
     : draft.gemini_model || '';
+  const presetModel = usingOpenRouter && isPresetModel(currentModel || resolveCatalogModel(config, 'openrouter'));
+  const thinkingValue = draft.reasoning_effort || (presetModel ? 'preset' : thinking);
 
   const possessive = isMain ? 'your' : `${viewer.name}'s`;
   const counts = status?.counts;
@@ -551,18 +561,21 @@ export function RecommendationsIntegration({ isOpen, onClose }: { isOpen: boolea
                     <SettingRow
                       htmlFor="recommendation-web-search"
                       label="Web search"
-                      description={usingOpenRouter
-                        ? 'Adds :online so the model sees live results. Billed by OpenRouter at roughly $0.005 per search, on top of the model.'
-                        : 'Lets the model look up what has come out lately. Requires a paid Gemini API key; free keys will get 429 errors.'}
+                      description={presetModel
+                        ? 'A preset takes web search from its own settings on OpenRouter.'
+                        : usingOpenRouter
+                          ? 'Adds :online so the model sees live results. Billed by OpenRouter at roughly $0.005 per search, on top of the model.'
+                          : 'Lets the model look up what has come out lately. Requires a paid Gemini API key; free keys will get 429 errors.'}
                       control={
                         <Switch
                           id="recommendation-web-search"
                           className="shrink-0"
-                          checked={webSearch}
+                          checked={webSearch && !presetModel}
+                          disabled={presetModel}
                           onCheckedChange={checked => patch({ web_search: checked })}
                         />
                       }
-                      note={!webSearch ? (
+                      note={!webSearch && !presetModel ? (
                         <Callout variant="info" className="text-xs">
                           Without it, nothing released after the model's training cut-off can be
                           recommended, however recent the rest of your library is.
@@ -576,11 +589,13 @@ export function RecommendationsIntegration({ isOpen, onClose }: { isOpen: boolea
                         label="Thinking"
                         description="How long the model works before it writes the list. Thinking is billed like the answer and shares the same reply budget, so more of it costs more and leaves less room for the list itself."
                         control={
-                          <Select value={thinking} onValueChange={value => patch({ reasoning_effort: value })}>
+                          <Select value={thinkingValue}
+                            onValueChange={value => patch({ reasoning_effort: value === 'preset' ? undefined : value })}>
                             <SelectTrigger id="recommendation-thinking" aria-label="Thinking" className="w-full shrink-0 sm:w-[160px]">
                               <SelectValue />
                             </SelectTrigger>
                             <SelectContent>
+                              {presetModel && <SelectItem value="preset">From the preset</SelectItem>}
                               <SelectItem value="none">Off</SelectItem>
                               <SelectItem value="minimal">Minimal</SelectItem>
                               <SelectItem value="low">Low</SelectItem>
@@ -589,7 +604,7 @@ export function RecommendationsIntegration({ isOpen, onClose }: { isOpen: boolea
                             </SelectContent>
                           </Select>
                         }
-                        note={thinking === 'medium' || thinking === 'high' ? (
+                        note={thinkingValue === 'preset' ? undefined : thinking === 'medium' || thinking === 'high' ? (
                           <Callout variant="warn" className="text-xs">
                             A long list can come back unfinished at this setting, because the thinking
                             uses up the reply before the recommendations are written.

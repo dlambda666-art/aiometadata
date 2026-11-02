@@ -65,6 +65,7 @@ function parsePositiveIntEnv(envValue: any, defaultValue: number, minValue: numb
 
 const { withEpoch, withGlobalEpoch }: any = require('./cacheEpoch');
 const { clampTtlToWarmWindow }: any = require('./catalogWarmWindow');
+const { endPageTtlSeconds }: any = require('./catalogPagination');
 const { clampMetaTtlToAirWindow }: any = require('./metaAirWindow');
 const {
   isRefreshAheadEnabled,
@@ -454,6 +455,7 @@ function classifyResult(result: any, error: any = null, cacheKey: string | null 
     cacheKey.includes('anilist_') ||
     cacheKey.includes('kitsu-') ||
     cacheKey.includes('mdblist-') ||
+    cacheKey.includes('publicmetadb-api:') ||
     cacheKey.includes('trakt-') ||
     cacheKey.includes('trakt_') ||
     cacheKey.includes('mdblist_') ||
@@ -832,6 +834,7 @@ function getCatalogContentScope(idOnly: string, catalogType: string, config: any
   // Mixed, not series: the row can carry anime too, so the anime providers have to
   // reach the config hash or a provider change would serve stale episode numbers.
   if (idOnly === 'simkl.upnext') return 'mixed';
+  if (idOnly.startsWith('simkl.watchlist.all.')) return 'mixed';
 
   if (idOnly === 'mdblist.upnext') return 'series';
   if (idOnly === 'mdblist.watchlist') return 'mixed';
@@ -1554,7 +1557,8 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
   // the previous one's picks being served for the rest of the catalog TTL, which
   // reads as the setting having done nothing.
   if (idOnly.startsWith('recommendations.')) {
-    const { RECOMMENDATION_EPOCH, pickOrder, voteFloor }: any = require('../utils/recommendations/provider');
+    const { RECOMMENDATION_EPOCH, pickOrder, voteFloor, reasonLanguage }: any = require('../utils/recommendations/provider');
+    const language = reasonLanguage(config);
     catalogConfig.recommendations = {
       epoch: RECOMMENDATION_EPOCH,
       provider: config.recommendations?.provider || '',
@@ -1576,6 +1580,7 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
       // simply unset still has to notice when the default itself moves.
       order: pickOrder(config, idOnly),
       minVotes: voteFloor(config, idOnly),
+      ...(language ? { reasonLanguage: language } : {}),
     };
   }
 
@@ -1723,6 +1728,17 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
   if (writeTTL !== cacheTTL) {
     cacheLogger.debug(`[Catalog] Holding ${idOnly} to ${writeTTL}s so it lapses before the next warm run (configured ${cacheTTL}s)`);
   }
+  const classifyPage = options.resultClassifier || classifyResult;
+  const endTtl = Math.min(writeTTL, endPageTtlSeconds());
+  options = {
+    ...options,
+    resultClassifier: (result: any, error: any, cacheKey: string) => {
+      if (!error && result?.endOfList === true && Array.isArray(result.metas) && result.metas.length === 0) {
+        return { type: 'EMPTY_RESULT', ttl: endTtl };
+      }
+      return classifyPage(result, error, cacheKey);
+    },
+  };
 
   const result = cachingDisabled
     ? normalizeReleaseAvailabilityInPayload(await method())
@@ -1733,6 +1749,7 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
   normalizeCreditsInPayload(result);
 
   const projected = projectRatingsInPayload(result, config, true);
+  if (projected && typeof projected === 'object') delete projected.endOfList;
 
   await applyImdbRatingProjectionToList(projected?.metas);
 

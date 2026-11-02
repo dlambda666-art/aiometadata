@@ -67,14 +67,14 @@ Every browsable catalog in the configuration becomes a library. Movie and series
 
 ### Collections
 
-The collection builder's entries are served in the order they hold on the home screen, ahead of the plain catalogs:
+Libraries are served in the order of the **Catalogs** list, which holds your collections too: drag a collection anywhere in it, between any two catalogs, and clients show it there. A collection that was never moved sits ahead of every catalog.
 
-- A **classic row** is a catalog placed early: its catalog becomes one of the first libraries, and does not appear a second time further down.
+- A **catalog** can carry **Row options**, from its menu in the list: a row title that only Jellyfin clients see, a hidden title, and numbering for a top-ten style row. Its tags decide which users see it.
 - A **collection** becomes a library of its own, typed as a box set library so clients draw it as one, with the collection's backdrop as its artwork. Each **folder** in it is one box set, carrying the folder's cover, backdrop and logo, drawn in the folder's shape (poster, landscape or square). Opening a box set lists the folder's **sources** walked in order, one after the other, with a source's genre applied where one is set and duplicates dropped, paged the way any library is. A folder whose sources are all outside the user's catalogs is not shown, and a collection with no folder left is not shown either.
 
 ![A collection in the builder, its Users field marked Jellyfin only](images/jellyfin/collection-users.jpg)
 
-Both can be restricted to users through the **Users** field in the editor. An entry with no users is for everyone. A collection or row cannot be created or edited from a client; the server declines the request and points at the configuration.
+A collection can be restricted to users through the **Users** field in the editor. A collection with no users is for everyone. A collection cannot be created or edited from a client; the server declines the request and points at the configuration. Rows in an imported design become row options on their catalogs when the import is applied.
 
 ### Search
 
@@ -219,7 +219,15 @@ AIOStreams has a Jellyfin server of its own. In that setup the client signs in t
 - **playback.** AIOStreams sends the plays its clients report as start, stop, mark-played and mark-unplayed events, with the title known under every id it holds, so a show keyed on MyAnimeList with episodes keyed on Kitsu is still recorded once. A stop past the trackers' 80 percent counts as a watch; an earlier one is a resume point. Each event is reported to every tracker with watch tracking on, the same way a play through this addon's own server is. A repeated event within `PLAYBACK_MARK_REPEAT_WINDOW` is an echo and dropped.
 - **watch_state.** AIOStreams reads back what the trackers and this addon hold, so its Continue Watching reflects other devices. The answer is the same merged view this addon's own resume shelf uses, following the **Trackers** pick, newest first, `WATCH_STATE_PULL_ITEMS` titles at a time, and may be reused for `WATCH_STATE_PULL_TTL` seconds before AIOStreams asks again.
 
-**Several people on AIOStreams' server.** Once the configuration has a user card, or a name under **Also known as (AIOStreams)** on your own card, the manifest tells AIOStreams it may name the viewer (`watchState.viewers`). An event carrying a `viewer`, or a read asking `?viewer=`, is matched to a user here by name, case aside: your own user's name, a user card's name, or one of the names listed under **Also known as (AIOStreams)** on a card. A matched user's plays, marks, drops and hearts go to their own accounts, and the read answers from their accounts and picks, as on this addon's own server. The handoff keeps no positions of its own, so the plays of a user without accounts are accepted and recorded nowhere; AIOStreams keeps their Continue Watching. An event without a viewer is yours, as before, and so is every event while the configuration has no user cards or AIOStreams names. Otherwise an event naming nobody here is refused and recorded nowhere, so a family member without a card never lands on your trackers; the log shows the name. Anyone holding the install URL can act as any user through these two resources, the same trust the URL already carried for yours.
+**Several people on AIOStreams' server.** Once the configuration has a user card, or a name under **Also known as (AIOStreams)** on your own card, the manifest tells AIOStreams it may name the viewer (`watchState.viewers`). An event carrying a `viewer`, or a read asking `?viewer=`, is matched to a user here by name, case aside: your own user's name, a user card's name, or one of the names listed under **Also known as (AIOStreams)** on a card. A matched user's plays, marks, drops and hearts go to their own accounts, and the read answers from their accounts and picks, as on this addon's own server. The handoff keeps no positions of its own, so the plays of a user without accounts are accepted and recorded nowhere; AIOStreams keeps their Continue Watching. An event without a viewer is yours, as before, and so is every event while the configuration has no user cards or AIOStreams names. Otherwise an event naming nobody here is refused and recorded nowhere, so a family member without a card never lands on your trackers; the log shows the name. Anyone holding the install URL can act as any user through these two resources and the catalog reads below, the same trust the URL already carried for yours.
+
+**Catalog rows can follow the user too.** A catalog read asking `?viewer=` is matched the same way and answered as that user: the **Recommendations** rows from their own history and picks, and the catalogs that mean "this account's own list" from their accounts, as on this addon's own server. AIOStreams forwards the query of an addon's URL to every read, so the address only has to name the user. Keep one install of this addon and, in the variant each user picks in AIOStreams, point it at their name:
+
+```
+set presets[instanceId=<this addon's instance id>].options.manifestUrl = "https://<your instance>/stremio/<uuid>/manifest.json?viewer=<name>"
+```
+
+The catalogs keep their arrangement, since the addon is still the same instance. Adding a second copy of the addon for a user instead shows them both their rows and yours. A read without a viewer is yours, as before, and one naming nobody here is refused; the manifest logs the name it did not know.
 
 AIOStreams sends and reads these only with its `WATCH_STATE_HANDOFF_ENABLED` switched on. With **Playback reporting** left on **When a title is opened**, neither resource is declared and AIOStreams records nothing through this addon; opening a title is then the only signal, as for any other client.
 

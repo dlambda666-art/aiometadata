@@ -1,6 +1,6 @@
 import consola from 'consola';
 import type { TasteProfile } from './profile';
-import { collectWatchedRows, titleKeys, watchedIndex, type WatchedRow } from './history';
+import { collectWatchedRows, rowKind, titleKeys, watchedIndex, type WatchedRow } from './history';
 import { envInt } from '../envNumber';
 
 const logger = consola.withTag('Recommendations');
@@ -123,7 +123,7 @@ function describeProfile(profile: TasteProfile): string {
  *  own history, not fixed here, and the year is stated: it has no clock. */
 export function eraBrief(rows: WatchedRow[], kind: RecommendKind, want: number, live = true): string {
   const now = new Date().getFullYear();
-  const relevant = kind === 'all' ? rows : rows.filter(row => row.kind === kind);
+  const relevant = kind === 'all' ? rows : rows.filter(row => rowKind(row) === kind);
   const years = relevant.map(row => row.year).filter((year): year is number => !!year).sort((a, b) => a - b);
 
   if (years.length < 10) return `It is currently ${now}.`;
@@ -165,6 +165,14 @@ export function eraBrief(rows: WatchedRow[], kind: RecommendKind, want: number, 
   ].filter(Boolean).join(' ');
 }
 
+function languageName(language: string): string {
+  try {
+    return new Intl.DisplayNames(['en'], { type: 'language' }).of(language) || language;
+  } catch {
+    return language;
+  }
+}
+
 function buildPrompt(
   profile: TasteProfile,
   kind: RecommendKind,
@@ -172,7 +180,8 @@ function buildPrompt(
   want: number,
   watched: WatchedRow[] = [],
   searchMode: SearchMode = false,
-  recent = ''
+  recent = '',
+  language = ''
 ): string {
   // Each kind has its own row, so they must not overlap. Anime is television and
   // anime films are films, so without saying otherwise a quarter-anime library
@@ -204,6 +213,7 @@ function buildPrompt(
     '',
     'Score each pick\'s "fit" from 1 to 10 for how well it suits them.',
     'Return JSON: {"picks":[{"title":"…","year":1999,"kind":"movie"|"series","fit":8,"reason":"…"}]}',
+    ...(language ? [`Write each reason in ${languageName(language)}, and keep titles as you would otherwise name them.`] : []),
     'Keep each reason under 15 words. Long reasons cost more than they are worth here,',
     'and enough of them will truncate the reply before the list is finished.',
   ].join('\n');
@@ -418,11 +428,12 @@ async function resolveSuggestion(pick: Suggestion, config: any, genres: Genres):
  */
 /** Keyed by every input that changes the answer. */
 export function picksKey(config: any, userUUID: string, kind: RecommendKind, want = DEFAULT_WANT): string {
-  const { resolveProvider, reasoningEffort, RECOMMENDATION_EPOCH }: any = require('./provider');
+  const { resolveProvider, reasoningEffort, reasonLanguage, RECOMMENDATION_EPOCH }: any = require('./provider');
   const chosen = resolveProvider(config);
   const { resolveSources, viewerKey }: any = require('./history');
   const sources = resolveSources(config).choice;
-  return `recommendations:picks:v${RECOMMENDATION_EPOCH}:${viewerKey(config, userUUID)}:${kind}:${want}:${sources}:${chosen?.provider || 'none'}:${chosen?.model || 'none'}:${chosen?.webSearch ? 'web' : 'offline'}:${reasoningEffort(config)}`;
+  const language = reasonLanguage(config);
+  return `recommendations:picks:v${RECOMMENDATION_EPOCH}:${viewerKey(config, userUUID)}:${kind}:${want}:${sources}:${chosen?.provider || 'none'}:${chosen?.model || 'none'}:${chosen?.webSearch ? 'web' : 'offline'}:${reasoningEffort(config)}${language ? `:${language}` : ''}`;
 }
 
 export async function recommend(
@@ -433,7 +444,7 @@ export async function recommend(
   want = DEFAULT_WANT
 ): Promise<any[]> {
   const { cacheWrapGlobal }: any = require('../../lib/getCache');
-  const { resolveProvider, reasoningEffort, refreshTtl }: any = require('./provider');
+  const { resolveProvider, reasoningEffort, reasonLanguage, refreshTtl }: any = require('./provider');
   const chosen = resolveProvider(config);
   const key = picksKey(config, userUUID, kind, want);
   const ttl = refreshTtl(config);
@@ -442,10 +453,12 @@ export async function recommend(
     const watched = await collectWatchedRows(config, userUUID);
     const known = await watchedIndex(config, userUUID);
     // Only the most recent slice: the exclusion list is a prompt cost, and the
-    // resolved results are filtered against the full set afterwards anyway.
-    const exclude = known.rows
-      .filter(row => kind === 'all' || row.kind === kind)
-      .sort((a, b) => String(b.watchedAt || '').localeCompare(String(a.watchedAt || '')))
+    // resolved results are filtered against the full set afterwards anyway. The
+    // row's own kind goes first, then the rest, so the list is never empty.
+    const recentFirst = (a: WatchedRow, b: WatchedRow) => String(b.watchedAt || '').localeCompare(String(a.watchedAt || ''));
+    const own = known.rows.filter(row => kind === 'all' || rowKind(row) === kind);
+    const others = kind === 'all' ? [] : known.rows.filter(row => rowKind(row) !== kind);
+    const exclude = [...own.sort(recentFirst), ...others.sort(recentFirst)]
       .slice(0, envInt('RECOMMENDATION_EXCLUDE_MAX', 400, 0))
       .map(row => (row.year ? `${row.title} (${row.year})` : row.title));
 
@@ -466,7 +479,7 @@ export async function recommend(
       // The search happened in the pass above and its answer is in the prompt,
       // so this call reads context rather than paying to search again.
       model: recent ? String(model).replace(/:online$/, '') : model,
-      prompt: buildPrompt(profile, kind, exclude, asked, watched, searchMode, recent),
+      prompt: buildPrompt(profile, kind, exclude, asked, watched, searchMode, recent, reasonLanguage(config)),
       systemPrompt: systemPrompt(searchMode),
       timeout: 90000,
       maxTokens: replyBudget(asked, reasoningEffort(config)),

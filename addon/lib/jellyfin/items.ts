@@ -6,13 +6,16 @@ import { LRUCache } from 'lru-cache';
 import { envInt } from '../../utils/envNumber';
 import { encodeJellyfinId, parseStremioId } from './ids';
 import { normaliseJellyfinId } from './idsCodec';
+import { rememberSeriesRatingIds } from './seriesRatingIds';
 import { EMPTY_USER_DATA } from './dto';
 import { placeholderSources } from './streams';
 import redis from '../redisClient';
 import type { CatalogRef } from './views';
-import { viewerAccountOwner, viewerMarksUnaired, viewerProfile, viewerReadsExtensions } from './viewer';
+import { viewerAccountOwner, viewerMarksUnaired, viewerProfile, viewerReadsExtensions, viewerWantsPeople } from './viewer';
 import { SERVER_WATCHLIST_PREFIX } from '../serverWatchlist';
 import { isLandscapeCatalogConfig } from '../../utils/catalogPosterShape';
+import { configCatalogFor } from '../collectionBuilder/homeOrder';
+import { shuffleMetas } from '../../utils/mergedCatalog';
 
 const logger = consola.withTag('Jellyfin');
 
@@ -96,6 +99,7 @@ function imageTtl(): number {
 // as one command per scope rather than five per item.
 const pendingImages = new Map<string, Map<string, string>>();
 let imageFlushTimer: NodeJS.Timeout | null = null;
+const IMAGE_FIELDS_PER_COMMAND = 500;
 
 function scheduleImageFlush(): void {
   if (imageFlushTimer) return;
@@ -119,13 +123,17 @@ export async function flushRememberedImages(): Promise<void> {
   const ttl = imageTtl();
   // One hash per scope rather than a key per item: a key each grew to six
   // figures on a busy instance and slowed every scan of the keyspace.
-  const tx = redis.multi();
-  for (const [hash, fields] of batches) {
-    const flat: string[] = [];
-    for (const [field, value] of fields) flat.push(field, value);
-    tx.hsetex(hash, 'EX', ttl, 'FIELDS', fields.size, ...flat).expire(hash, ttl, 'NX').expire(hash, ttl, 'GT');
-  }
   try {
+    const tx = redis.multi();
+    for (const [hash, fields] of batches) {
+      // Spread arguments are bounded by the stack, so a burst of art goes in slices.
+      const entries = [...fields];
+      for (let at = 0; at < entries.length; at += IMAGE_FIELDS_PER_COMMAND) {
+        const slice = entries.slice(at, at + IMAGE_FIELDS_PER_COMMAND);
+        tx.hsetex(hash, 'EX', ttl, 'FIELDS', slice.length, ...slice.flat());
+      }
+      tx.expire(hash, ttl, 'NX').expire(hash, ttl, 'GT');
+    }
     await tx.exec();
   } catch {
     // Art is a cache; a lost write is read from the meta again.
@@ -254,6 +262,7 @@ export async function fetchCatalogPage(
     if (typeof body?.rawLength === 'number') rawLengths.set(metas, body.rawLength);
     if (typeof body?.pageSize === 'number' && body.pageSize > 0) pageSizes.set(metas, body.pageSize);
     if (body?.served === true) servedPages.add(metas);
+    if (body?.randomize === true) randomizedPages.add(metas);
     return metas;
   } catch (error: any) {
     failedPages.set(memo, true);
@@ -265,6 +274,7 @@ export async function fetchCatalogPage(
 const rawLengths = new WeakMap<any[], number>();
 const pageSizes = new WeakMap<any[], number>();
 const servedPages = new WeakSet<any[]>();
+const randomizedPages = new WeakSet<any[]>();
 const servedCatalogs = new LRUCache<string, true>({
   max: envInt('JELLYFIN_PAGE_LENGTH_CACHE_MAX', 2000, 1),
   ttl: envInt('JELLYFIN_CATALOG_LENGTH_TTL', 3600, 60) * 1000,
@@ -284,6 +294,11 @@ export interface Window {
   items: any[];
   hasMore: boolean;
   failed?: boolean;
+  randomize?: boolean;
+}
+
+export function servedOrder(items: any[], window: Partial<Window>): any[] {
+  return window.randomize ? shuffleMetas(items) : items;
 }
 
 /**
@@ -309,10 +324,26 @@ const catalogLengths = new LRUCache<string, number>({
   ttl: envInt('JELLYFIN_CATALOG_LENGTH_TTL', 3600, 60) * 1000,
 });
 
+// A rebuilt recommendation row can change length and order, so its lengths and
+// walk positions are keyed by the rebuild it was served from. Read before the
+// keys are built, so every process moves to a rebuild on its next request.
+const rowGenerations = new LRUCache<string, string>({ max: envInt('JELLYFIN_PAGE_LENGTH_CACHE_MAX', 2000, 1) });
+const isRecommendationRow = (catalog: CatalogRef): boolean => catalog.id.startsWith('recommendations.');
+const rowViewer = (userUUID: string): string => (viewerProfile() ? `${userUUID}#${viewerProfile()}` : userUUID);
+
+async function readRowGeneration(userUUID: string, catalogs: CatalogRef[]): Promise<void> {
+  if (!catalogs.some(isRecommendationRow)) return;
+  const viewer = rowViewer(userUUID);
+  const stamp = await require('../../utils/recommendations/refresh').rowStamp(viewer).catch(() => '');
+  rowGenerations.set(viewer, stamp);
+}
+
 function lengthKeyFor(userUUID: string, catalog: CatalogRef, extras: Record<string, string>, tags: string[], keepKey = ''): string {
   const owner = viewerAccountOwner();
-  const viewer = catalog.id.startsWith(SERVER_WATCHLIST_PREFIX) || catalog.id.startsWith('recommendations.') ? viewerProfile() : '';
-  return `${userUUID}|${catalog.type}|${catalog.id}|${extras.genre ?? ''}|${extras.search ?? ''}|${tags.join(',')}|${keepKey}${owner ? `|@${owner}` : ''}${viewer ? `|#${viewer}` : ''}`;
+  const row = isRecommendationRow(catalog);
+  const viewer = catalog.id.startsWith(SERVER_WATCHLIST_PREFIX) || row ? viewerProfile() : '';
+  const generation = row ? rowGenerations.get(rowViewer(userUUID)) : '';
+  return `${userUUID}|${catalog.type}|${catalog.id}|${extras.genre ?? ''}|${extras.search ?? ''}|${tags.join(',')}|${keepKey}${owner ? `|@${owner}` : ''}${viewer ? `|#${viewer}` : ''}${generation ? `|g${generation}` : ''}`;
 }
 
 export function knownCatalogLength(userUUID: string, catalog: CatalogRef, extras: Record<string, string> = {}, tags: string[] = [], keepKey = ''): number | undefined {
@@ -333,6 +364,7 @@ function rememberLength(kind: 'catalog' | 'page', key: string, value: number): v
 
 export async function warmCatalogLengths(userUUID: string, catalogs: CatalogRef[], extras: Record<string, string> = {}, tags: string[] = [], keepKey = ''): Promise<void> {
   if (!redis || catalogs.length === 0) return;
+  await readRowGeneration(userUUID, catalogs);
   const wanted: Array<{ kind: 'catalog' | 'page'; key: string; at: string }> = [];
   for (const catalog of catalogs) {
     const lengthKey = lengthKeyFor(userUUID, catalog, extras, tags, keepKey);
@@ -390,6 +422,7 @@ export async function fetchWindow(
   pick?: (metas: any[]) => Promise<any[]>
 ): Promise<Window> {
   const filtering = !!keep || !!pick;
+  await readRowGeneration(userUUID, [catalog]);
   const lengthKey = lengthKeyFor(userUUID, catalog, extras, tags, keepKey);
   const pageKey = lengthKeyFor(userUUID, catalog, extras, tags);
   let pageLength = pageLengths.get(pageKey);
@@ -418,6 +451,7 @@ export async function fetchWindow(
   let pages = 0;
   let exhausted = false;
   let failed = false;
+  let randomize = false;
   let budget = maxPages((offset + limit) * (filtering ? 2 : 1), pageLength || 0);
 
   // A length counts what a client was shown, which runs behind the catalog's own
@@ -454,6 +488,7 @@ export async function fetchWindow(
         stop = true;
         break;
       }
+      if (randomizedPages.has(page)) randomize = true;
       if (servedPages.has(page) && !sequential) {
         sequential = true;
         servedCatalogs.set(pageKey, true);
@@ -529,10 +564,11 @@ export async function fetchWindow(
     // A walk cut short by its page budget has more behind it, even if the window is short.
     hasMore: collected.length > offset + limit || (!exhausted && !failed),
     ...(failed ? { failed: true } : {}),
+    ...(randomize ? { randomize: true } : {}),
   };
 }
 
-function parseRuntimeTicks(runtime: any): number | null {
+export function parseRuntimeTicks(runtime: any): number | null {
   if (typeof runtime !== 'string') return null;
   const hours = /(\d+)\s*h/.exec(runtime);
   const minutes = /(\d+)\s*min/.exec(runtime);
@@ -675,6 +711,13 @@ function itemTypeOf(meta: any, mediaType: string): 'Movie' | 'Series' | 'BoxSet'
   return isBoxSetMeta(meta) ? 'BoxSet' : jellyfinTypeFor(meta?.type || mediaType);
 }
 
+function ratingFields(meta: any): { OfficialRating: string | null; CustomRating?: string | null } {
+  const extras = meta?.app_extras;
+  const rating = extras?.certification || null;
+  const local = extras?.certifications ? extras.certificationLocal || rating : rating;
+  return local === rating ? { OfficialRating: rating } : { OfficialRating: local, CustomRating: rating };
+}
+
 export function metaToBaseItem(
   meta: any,
   mediaType: string,
@@ -700,6 +743,7 @@ export function metaToBaseItem(
   if (images.thumb) imageTags.Thumb = imageTag(images.thumb);
   if (wide) imageTags.Primary = wideTag(imageTags.Thumb);
   const ids = providerIds(meta);
+  if (itemType === 'Series') rememberSeriesRatingIds(id, meta);
 
   return {
     Name: meta.name,
@@ -721,11 +765,11 @@ export function metaToBaseItem(
       Id: encodeJellyfinId({ k: 'genre', t: mediaType, c: 'all', g }),
     })),
     CommunityRating: parseRating(meta.imdbRating),
-    OfficialRating: meta.app_extras?.certification || null,
+    ...ratingFields(meta),
     RunTimeTicks: itemType === 'BoxSet' ? null : parseRuntimeTicks(meta.runtime),
     ProviderIds: ids,
     ExternalUrls: externalUrls(ids, itemType === 'Series'),
-    People: peopleFrom(meta, serverId),
+    People: viewerWantsPeople() ? peopleFrom(meta, serverId) : [],
     Studios: studiosOf(meta),
     Tags: Array.isArray(meta.keywords) ? meta.keywords : [],
     Taglines: typeof meta.tagline === 'string' && meta.tagline ? [meta.tagline] : [],
@@ -764,19 +808,8 @@ function airScheduleOf(meta: any): any {
   return { AirDays: meta.airDays, ...(typeof meta.airTime === 'string' && meta.airTime ? { AirTime: meta.airTime } : {}) };
 }
 
-function catalogSettingsFor(config: any, catalog: { id: string; type: string }): any {
-  const catalogs: any[] = Array.isArray(config?.catalogs) ? config.catalogs : [];
-  const exact = catalogs.find((c) => c.id === catalog.id && (c.type === catalog.type || c.displayType === catalog.type));
-  if (exact) return exact;
-  const suffix = catalog.id.match(/_(movie|series|anime|all)$/);
-  if (!suffix) return undefined;
-  const stripped = catalog.id.slice(0, -suffix[0].length);
-  return catalogs.find((c) => c.id === stripped && c.type === suffix[1])
-    ?? catalogs.find((c) => c.id === stripped && (c.type === catalog.type || c.displayType === catalog.type));
-}
-
 export function isLandscapeCatalog(config: any, catalog: { id: string; type: string }): boolean {
-  return isLandscapeCatalogConfig(config, catalogSettingsFor(config, catalog));
+  return isLandscapeCatalogConfig(config, configCatalogFor(config, catalog));
 }
 
 export function showLandscape(items: any[]): void {
@@ -856,6 +889,7 @@ const metaMemo = new LRUCache<string, any>({
   ttl: envInt('JELLYFIN_META_MEMO_TTL', 60, 1) * 1000,
 });
 const metaInFlight = new Map<string, Promise<any | null>>();
+const NO_META = Symbol('no meta');
 
 function episodeKindExtension(video: any): any {
   const filler = (video.isFiller ?? video.filler) === true;
@@ -883,6 +917,7 @@ async function readMeta(
 ): Promise<any | null> {
   const key = `${userUUID}|${stremioType}|${id}${beforeArt ? '|raw' : ''}`;
   const held = metaMemo.get(key);
+  if (held === NO_META) return null;
   if (held) return held;
   const running = metaInFlight.get(key);
   if (running) return running;
@@ -891,7 +926,7 @@ async function readMeta(
   const work = (async () => {
     try {
       const { invokeRoute } = require('../inProcessRoutes');
-      const reply = await invokeRoute('meta', url, { userUUID, type: stremioType, id, ...(beforeArt ? { beforeArt: '1' } : {}) }, routeTimeout());
+      const reply = await invokeRoute('meta', url, { userUUID, type: stremioType, id, forJellyfin: '1', ...(beforeArt ? { beforeArt: '1' } : {}) }, routeTimeout());
       if (reply.status < 200 || reply.status >= 300) {
         logger.debug(`Meta ${stremioType}/${id} returned ${reply.status}`);
         return null;
@@ -901,6 +936,8 @@ async function readMeta(
       if (meta) {
         metaMemo.set(key, meta);
         if (stremioType === 'series' && !beforeArt) require('./episodeIndex').rememberSeriesIndex(userUUID, id, meta);
+      } else {
+        metaMemo.set(key, NO_META);
       }
       return meta;
     } catch (error: any) {
@@ -1095,6 +1132,7 @@ export function buildEpisode(
   parentImages?: Record<string, any>
 ): any {
   const art = parentImages ?? parentArt(meta, seriesId, serverId);
+  rememberSeriesRatingIds(seriesId, meta);
   {
     const hasSeason = Number.isInteger(video.season);
 
@@ -1137,7 +1175,7 @@ export function buildEpisode(
       SeriesId: seriesId,
       SeriesName: meta.name,
       OriginalLanguage: originalLanguage(meta),
-      OfficialRating: meta.app_extras?.certification || null,
+      ...ratingFields(meta),
       ParentIndexNumber: hasSeason ? video.season : null,
       IndexNumber: Number(video.episode),
       Overview: video.overview || null,
