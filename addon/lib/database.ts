@@ -490,16 +490,6 @@ class Database {
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (user_uuid, profile, meta_id)
       )`,
-      `CREATE TABLE IF NOT EXISTS jellyfin_playlists (
-        user_uuid TEXT NOT NULL,
-        profile TEXT NOT NULL DEFAULT '',
-        id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        items TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        PRIMARY KEY (user_uuid, profile, id)
-      )`,
       `CREATE TABLE IF NOT EXISTS jellyfin_ratings (
         user_uuid TEXT NOT NULL,
         profile TEXT NOT NULL DEFAULT '',
@@ -727,16 +717,6 @@ class Database {
         meta_id TEXT NOT NULL,
         updated_at BIGINT NOT NULL,
         PRIMARY KEY (user_uuid, profile, meta_id)
-      )`,
-      `CREATE TABLE IF NOT EXISTS jellyfin_playlists (
-        user_uuid VARCHAR(64) NOT NULL,
-        profile TEXT NOT NULL DEFAULT '',
-        id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        items TEXT NOT NULL,
-        created_at BIGINT NOT NULL,
-        updated_at BIGINT NOT NULL,
-        PRIMARY KEY (user_uuid, profile, id)
       )`,
       `CREATE TABLE IF NOT EXISTS jellyfin_ratings (
         user_uuid VARCHAR(64) NOT NULL,
@@ -1356,13 +1336,6 @@ class Database {
     return (await this.allQuery(query, params)) || [];
   }
 
-  /** Episodes played between two times. */
-  async listPlayedBetween(userUUID: string, profile: string, from: number, to: number): Promise<Array<{ video_id: string; last_played_at: number }>> {
-    const p = this.type === 'sqlite' ? () => '?' : ((n = 0) => () => `$${++n}`)();
-    const query = `SELECT video_id, last_played_at FROM jellyfin_playstate WHERE user_uuid = ${p()} AND profile = ${p()} AND played = 1 AND last_played_at >= ${p()} AND last_played_at <= ${p()} AND video_id LIKE '%:%:%'`;
-    return (await this.allQuery(query, [userUUID, profile, from, to])) || [];
-  }
-
   async countPlayedSince(since: number): Promise<number> {
     const query = this.type === 'sqlite'
       ? 'SELECT COUNT(*) AS count FROM jellyfin_playstate WHERE last_played_at >= ? AND played = 1'
@@ -1470,8 +1443,7 @@ class Database {
     } else if (patch.watch && Number.isFinite(patch.watch.at) && patch.watch.at > 0) {
       logged = await this.logWatch(userUUID, profile, videoId, patch.watch, Boolean(existing?.played), origin);
     }
-    // An unmark takes the plays back, keeping its count only to mark the title unwatched, so a watch after it is the first again.
-    const playCount = becamePlayed ? 1 : (existing?.play_count ?? 0) + (logged && patch.watch?.kind === 'finish' ? 1 : 0);
+    const playCount = (existing?.play_count ?? 0) + (becamePlayed || (logged && patch.watch?.kind === 'finish') ? 1 : 0);
     const lastPlayedAt = patch.lastPlayedAt === undefined ? (existing?.last_played_at ?? null) : patch.lastPlayedAt;
 
     const query = this.type === 'sqlite'
@@ -2095,36 +2067,6 @@ class Database {
         await this.runQuery(query, [userUUID, profile, metaId]);
       }
     }
-  }
-
-  // Read from the primary, so a client reading a playlist straight after changing it sees the change.
-  async listPlaylists(userUUID: string, profile: string): Promise<any[]> {
-    const query = this.type === 'sqlite'
-      ? 'SELECT id, name, items, created_at, updated_at FROM jellyfin_playlists WHERE user_uuid = ? AND profile = ? ORDER BY created_at'
-      : 'SELECT id, name, items, created_at, updated_at FROM jellyfin_playlists WHERE user_uuid = $1 AND profile = $2 ORDER BY created_at';
-    return this.allPrimaryQuery(query, [userUUID, profile]);
-  }
-
-  async getPlaylist(userUUID: string, profile: string, id: string): Promise<any | null> {
-    const query = this.type === 'sqlite'
-      ? 'SELECT id, name, items, created_at, updated_at FROM jellyfin_playlists WHERE user_uuid = ? AND profile = ? AND id = ?'
-      : 'SELECT id, name, items, created_at, updated_at FROM jellyfin_playlists WHERE user_uuid = $1 AND profile = $2 AND id = $3';
-    return (await this.allPrimaryQuery(query, [userUUID, profile, id]))[0] ?? null;
-  }
-
-  async savePlaylist(userUUID: string, profile: string, playlist: { id: string; name: string; items: string[]; createdAt: number; updatedAt: number }): Promise<void> {
-    const query = this.type === 'sqlite'
-      ? 'INSERT INTO jellyfin_playlists (user_uuid, profile, id, name, items, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (user_uuid, profile, id) DO UPDATE SET name = excluded.name, items = excluded.items, updated_at = excluded.updated_at'
-      : 'INSERT INTO jellyfin_playlists (user_uuid, profile, id, name, items, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (user_uuid, profile, id) DO UPDATE SET name = EXCLUDED.name, items = EXCLUDED.items, updated_at = EXCLUDED.updated_at';
-    await this.runQuery(query, [userUUID, profile, playlist.id, playlist.name, JSON.stringify(playlist.items), playlist.createdAt, playlist.updatedAt]);
-  }
-
-  async deletePlaylist(userUUID: string, profile: string, id: string): Promise<boolean> {
-    const query = this.type === 'sqlite'
-      ? 'DELETE FROM jellyfin_playlists WHERE user_uuid = ? AND profile = ? AND id = ?'
-      : 'DELETE FROM jellyfin_playlists WHERE user_uuid = $1 AND profile = $2 AND id = $3';
-    const result = await this.runQuery(query, [userUUID, profile, id]);
-    return Number(result?.changes ?? result?.rowCount ?? 0) > 0;
   }
 
   async listRatings(userUUID: string, profile: string, metaIds: string[]): Promise<any[]> {

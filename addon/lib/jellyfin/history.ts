@@ -1,7 +1,6 @@
 import { listProfiles, type Profile } from './profiles';
 import { encodeJellyfinId, normaliseJellyfinId, parseStremioId } from './ids';
 import { groupBySpelling } from './aliases';
-import { playCountOf } from './dto';
 import { createHash } from 'crypto';
 
 const ANIME_IDS = /^(kitsu|mal|anilist|anidb):/;
@@ -83,7 +82,7 @@ function entryOf(group: any[]): HistoryEntry {
     itemKey: ids.join(KEY_JOIN),
     videoId: preferredId(ids),
     played,
-    playCount: playCountOf(played, Math.max(0, ...group.map((row) => Number(row.play_count) || 0))),
+    playCount: Math.max(0, ...group.map((row) => Number(row.play_count) || 0)),
     positionMs: played ? 0 : Math.max(0, ...group.map((row) => Number(row.position_ms) || 0)),
     durationMs: Math.max(0, ...group.map((row) => Number(row.runtime_ms) || 0)),
     lastPlayedAt: Math.max(0, ...group.map((row) => Number(row.last_played_at) || 0)) || null,

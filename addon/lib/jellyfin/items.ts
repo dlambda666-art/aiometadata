@@ -350,11 +350,6 @@ export function knownCatalogLength(userUUID: string, catalog: CatalogRef, extras
   return catalogLengths.get(lengthKeyFor(userUUID, catalog, extras, tags, keepKey));
 }
 
-/** How many titles one page of the catalog holds, once a window has read one. */
-export function knownPageLength(userUUID: string, catalog: CatalogRef, extras: Record<string, string> = {}, tags: string[] = []): number | undefined {
-  return pageLengths.get(lengthKeyFor(userUUID, catalog, extras, tags));
-}
-
 const walkConcurrency = (): number => envInt('JELLYFIN_CATALOG_WALK_CONCURRENCY', 4, 1);
 const lengthTtl = (): number => envInt('JELLYFIN_CATALOG_LENGTH_TTL', 3600, 60);
 const catalogLengthRedisKey = (key: string): string => `jf:len:v3:catalog:${key}`;
@@ -867,128 +862,17 @@ export async function pageChildren(
   return { page, total: kept.length };
 }
 
-/** A Jellyfin list parameter, sent separated or repeated. */
-function listParam(value: unknown, separator: RegExp): string[] {
-  return (Array.isArray(value) ? value : [value])
-    .filter((entry) => entry !== undefined && entry !== null)
-    .flatMap((entry) => String(entry).split(separator))
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-}
-
-const timeOf = (value: unknown): number | null => {
-  const at = Date.parse(String(value ?? ''));
-  return Number.isFinite(at) ? at : null;
-};
-
-const SORT_VALUES: Record<string, (item: any) => number | string | null> = {
-  communityrating: (item) => (typeof item?.CommunityRating === 'number' ? item.CommunityRating : null),
-  premieredate: (item) => timeOf(item?.PremiereDate),
-  productionyear: (item) => (typeof item?.ProductionYear === 'number' ? item.ProductionYear : null),
-  datecreated: (item) => timeOf(item?.DateCreated),
-  sortname: (item) => item?.SortName ?? item?.Name ?? null,
-};
-
-// A missing value sorts lowest, so it comes last when descending.
-function compareSortValues(a: number | string | null, b: number | string | null): number {
-  if (a === null || b === null) return a === b ? 0 : a === null ? -1 : 1;
-  if (typeof a === 'number' && typeof b === 'number') return a - b;
-  return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
-}
-
-/** Orders a list by SortBy and SortOrder; a key without its own order takes the first, and unknown keys change nothing. */
-export function sortItems(items: any[], sortBy: unknown, sortOrder: unknown): any[] {
-  const orders = listParam(sortOrder, /,/).map((order) => (order.toLowerCase() === 'descending' ? -1 : 1));
-  const plan: { value: (item: any) => number | string | null; sign: number }[] = [];
-  for (const [index, key] of listParam(sortBy, /,/).entries()) {
-    const sign = orders[index] ?? orders[0] ?? 1;
-    if (key.toLowerCase() === 'random') {
-      const draw = new Map(items.map((item) => [item, Math.random()]));
-      plan.push({ value: (item) => draw.get(item) ?? null, sign });
-      continue;
-    }
-    const value = SORT_VALUES[key.toLowerCase()];
-    if (value) plan.push({ value, sign });
-  }
-  if (!plan.length) return items;
-  return [...items].sort((a, b) => {
-    for (const { value, sign } of plan) {
-      const order = compareSortValues(value(a), value(b));
-      if (order) return order * sign;
-    }
-    return 0;
-  });
-}
-
-/** The tags a request filters on, lowercased; null when it names none. */
-export function wantedTags(value: unknown): Set<string> | null {
-  const tags = listParam(value, /[|,]/).map((tag) => tag.toLowerCase());
-  return tags.length ? new Set(tags) : null;
-}
-
-export const ANIME_TAG = 'anime';
-
-/** Whether an item carries one of the tags; anime is also known from where a title is listed. */
-export function hasWantedTag(item: any, tags: Set<string>, anime: boolean): boolean {
-  if (anime && tags.has(ANIME_TAG)) return true;
-  return (Array.isArray(item?.Tags) ? item.Tags : []).some((tag: unknown) => tags.has(String(tag).toLowerCase()));
-}
-
-export function isAnimeCatalogType(type: unknown): boolean {
-  return type === 'anime' || String(type ?? '').startsWith('anime.');
-}
-
 /** The same decision filterByIncludeTypes makes, taken on a meta. */
-/** The item types a request filters to, when it names any of the kinds a catalog holds. */
-function wantedTypes(includeItemTypes: string | undefined): Set<string> | null {
-  if (!includeItemTypes) return null;
-  const wanted = new Set(includeItemTypes.split(',').map((t) => t.trim()).filter(Boolean));
-  return wanted.has('Movie') || wanted.has('Series') || wanted.has('BoxSet') ? wanted : null;
-}
-
-/** The ratings a request keeps, from Jellyfin's pipe-separated OfficialRatings; null keeps every title. */
-function wantedRatings(officialRatings: unknown): Set<string> | null {
-  const list = String(officialRatings ?? '').split(/[|,]/).map((rating) => rating.trim().toUpperCase()).filter(Boolean);
-  return list.length ? new Set(list) : null;
-}
-
-/** The rating a title is shown with, as its OfficialRating. */
-export function officialRatingOf(meta: any): string | null {
-  return ratingFields(meta).OfficialRating;
-}
-
-/** Keeps the titles of the asked types and, when asked, ratings; a title with no rating matches no rating. */
 export function includeTypesFilter(
   mediaType: string,
-  includeItemTypes: string | undefined,
-  officialRatings?: unknown
+  includeItemTypes: string | undefined
 ): ((meta: any) => boolean) | undefined {
-  const wanted = wantedTypes(includeItemTypes);
-  const ratings = wantedRatings(officialRatings);
-  if (!wanted && !ratings) return undefined;
+  if (!includeItemTypes) return undefined;
 
-  return (meta: any) =>
-    (!wanted || wanted.has(itemTypeOf(meta, mediaType)))
-    && (!ratings || ratings.has(String(officialRatingOf(meta) ?? '').toUpperCase()));
-}
+  const wanted = new Set(includeItemTypes.split(',').map((t) => t.trim()).filter(Boolean));
+  if (!wanted.size || (!wanted.has('Movie') && !wanted.has('Series') && !wanted.has('BoxSet'))) return undefined;
 
-/** What a filtered list's lengths and cursors are held under: its types, and its ratings when it names any. */
-export function listFilterKey(includeItemTypes: unknown, officialRatings?: unknown): string {
-  const ratings = wantedRatings(officialRatings);
-  return `${includeItemTypes ? String(includeItemTypes) : ''}${ratings ? `|ratings:${[...ratings].sort().join('|')}` : ''}`;
-}
-
-// A catalog built here holds only its declared type: films and TVDB collections in a movie one, shows in a
-// series one. An external addon's catalog is not held to its type, so it is filtered item by item.
-const CATALOG_SERVES: Record<string, string[]> = { movie: ['Movie', 'BoxSet'], series: ['Series'] };
-const EXTERNAL_CATALOG = /^(custom|stremthru)\./;
-
-/** Whether a catalog can hold none of the asked types, so a filtered read passes it by unread. */
-export function catalogCannotServe(catalog: { id: string; type: string }, includeItemTypes: string | undefined): boolean {
-  const serves = CATALOG_SERVES[catalog.type];
-  const wanted = wantedTypes(includeItemTypes);
-  if (!serves || !wanted || EXTERNAL_CATALOG.test(catalog.id)) return false;
-  return !serves.some((type) => wanted.has(type));
+  return (meta: any) => wanted.has(itemTypeOf(meta, mediaType));
 }
 
 export function filterByIncludeTypes(items: any[], includeItemTypes: string | undefined): any[] {

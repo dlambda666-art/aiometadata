@@ -4,7 +4,6 @@ import { createHash } from 'crypto';
 import { envInt } from '../../utils/envNumber';
 import { credentialFor, sourceFor } from './trackerSource';
 import { generationOf, videoIdFor } from './resume';
-import { playCountOf } from './dto';
 
 const logger = consola.withTag('Jellyfin');
 
@@ -23,14 +22,6 @@ export async function ownNextUpRows(userUUID: string, profile: string): Promise<
   const rows: NextUpRow[] = [];
   const seen = new Set<string>();
   const handled = new Set<string>();
-  // Episodes written together, as a season marked or a history imported or synced at once, carry nearly the same
-  // time, so the newest of them is chance; the show goes on after the furthest of them instead.
-  const batchMs = envInt('JELLYFIN_NEXTUP_BATCH_SECONDS', 600, 0) * 1000;
-  const regularEpisode = (videoId: string) => {
-    const spelled = parseStremioId(videoId);
-    return spelled && spelled.episode !== null && spelled.episode !== undefined && spelled.season !== 0 ? spelled : null;
-  };
-  const isAfter = (a: any, b: any): boolean => (a.season ?? 0) > (b.season ?? 0) || ((a.season ?? 0) === (b.season ?? 0) && a.episode > b.episode);
   let after: { at: number; videoId: string } | null = null;
   let carry: any[] = [];
   for (let scanned = 0; rows.length < shows && scanned < scanCap; scanned += batch) {
@@ -45,24 +36,6 @@ export async function ownNextUpRows(userUUID: string, profile: string): Promise<
     const groupOf = new Map<string, any[]>();
     for (const group of (await groupBySpelling([...carry, ...records])) as any[][]) {
       for (const row of group) groupOf.set(String(row.video_id), group);
-    }
-    const byShow = new Map<string, any[]>();
-    if (batchMs > 0) {
-      // A batch can run on past this page, so the rest of the window below its last time is read once for every show.
-      const rest = records.length === batch && last ? await database.listPlayedBetween(userUUID, profile, Number(last.last_played_at) - batchMs, Number(last.last_played_at)).catch(() => []) : [];
-      // Filed under the id less its episode and less its season and episode, so either spelling finds it.
-      const file = (key: string, row: any) => {
-        const held = byShow.get(key);
-        if (held) held.push(row);
-        else byShow.set(key, [row]);
-      };
-      for (const row of [...carry, ...records, ...rest]) {
-        const id = String(row.video_id);
-        const episodeAt = id.lastIndexOf(':');
-        const seasonAt = id.lastIndexOf(':', episodeAt - 1);
-        if (seasonAt > 0) file(id.slice(0, seasonAt), row);
-        if (episodeAt > 0) file(id.slice(0, episodeAt), row);
-      }
     }
     carry = last ? records.filter((row) => Number(row.last_played_at) === Number(last.last_played_at)) : [];
     for (const r of records) {
@@ -88,18 +61,6 @@ export async function ownNextUpRows(userUUID: string, profile: string): Promise<
         if (!spelled || spelled.episode === null || spelled.episode === undefined) continue;
         lead = row;
         leadParsed = spelled;
-      }
-      const at = Number(r.last_played_at) || 0;
-      if (batchMs > 0 && at > 0) {
-        const together = (byShow.get(leadParsed.base) ?? [])
-          .filter((row) => Number(row.last_played_at) >= at - batchMs && Number(row.last_played_at) <= at)
-          .map((row) => String(row.video_id));
-        for (const videoId of together) {
-          const spelled = regularEpisode(videoId);
-          if (!spelled || spelled.base !== leadParsed.base || !isAfter(spelled, leadParsed)) continue;
-          lead = { ...lead, video_id: videoId };
-          leadParsed = spelled;
-        }
       }
       rows.push({
         metaId: leadParsed.base,
@@ -1789,7 +1750,7 @@ export async function applyWatchedState(
         item.UserData = {
           ...item.UserData,
           Played: played,
-          PlayCount: playCountOf(played, record?.play_count),
+          PlayCount: Math.max(played ? 1 : 0, Number(record?.play_count) || 0),
           PlaybackPositionTicks: Math.round((runtime * pause.progress) / 100),
           PlayedPercentage: pause.progress,
           LastPlayedDate: new Date(pause.updatedAt).toISOString(),
@@ -1800,7 +1761,7 @@ export async function applyWatchedState(
         item.UserData = {
           ...item.UserData,
           Played: true,
-          PlayCount: playCountOf(true, record.play_count),
+          PlayCount: Math.max(1, Number(record.play_count) || 0),
           PlaybackPositionTicks: 0,
           PlayedPercentage: 100,
           LastPlayedDate: new Date(trackerAt).toISOString(),
@@ -1814,7 +1775,7 @@ export async function applyWatchedState(
         item.UserData = {
           ...item.UserData,
           Played: Boolean(record.played),
-          PlayCount: playCountOf(Boolean(record.played), record.play_count),
+          PlayCount: Number(record.play_count) || 0,
           PlaybackPositionTicks: Math.round(position * 10000),
           PlayedPercentage: position > 0 && runtime > 0 ? (position / runtime) * 100 : record.played ? 100 : 0,
           ...(record.last_played_at ? { LastPlayedDate: new Date(Number(record.last_played_at)).toISOString() } : {}),
